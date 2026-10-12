@@ -990,7 +990,7 @@ func whatIs(_ name: String) -> String? {
 struct MenuView: View {
     @ObservedObject var m = Model.shared
     @State var tab = 0
-    @State private var showLeftovers = false
+    @State var showLeftovers = false
 
     var status: (title: String, line: String) {
         switch m.health {
@@ -1285,16 +1285,17 @@ enum CLI {
         m.junk = Disk.scan(); m.diskFree = Disk.free; m.diskTotal = Disk.total
         if demo {
             // sample leftovers for readme screenshots (same two baa caught for real while testing)
+            m.free = 74; m.level = 1
             m.scan.findings = [
                 Finding(id: "demo-1", kind: .ghost, title: "Python · build_index.py", detail: "its terminal or agent closed · idle 12m, running 12m",
                         bytes: 404 * 1_048_576, fix: .kill([])),
                 Finding(id: "demo-2", kind: .agent, title: "Dev server :3000 · python", detail: "started by Claude Code (my-app) · idle 12m",
                         bytes: 261 * 1_048_576, fix: .kill([])),
-            ] + m.scan.findings
-            m.spark = (0..<180).map { (i: Int) -> Int in let x = Double(i); return Int(58.0 - x * 0.12 + sin(x / 7.0) * 3.0) }
+            ]
+            m.spark = (0..<180).map { (i: Int) -> Int in let x = Double(i); return Int(70.0 + x * 0.02 + sin(x / 9.0) * 2.5) }
             m.freedToday = 2.3e9; m.freedAll = 48e9
         }
-        let panel = MenuView(tab: disk ? 1 : 0)
+        let panel = MenuView(tab: disk ? 1 : 0, showLeftovers: demo)
             .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .windowBackgroundColor)))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.1), lineWidth: 1))
             .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
