@@ -23,11 +23,9 @@ baa 🐏 is a little ram that headbutts all of that out of your mac.
 - pings you a few minutes before you run out
 - plays a tiny baa when it frees something 🐑 (you can mute it but it's the best part imo)
 
-<img src="docs/menubar.png" width="392" alt="baa in the menu bar">
-
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/menu-dark.png">
-  <img src="docs/menu.png" width="420" alt="baa menu bar panel">
+  <img src="docs/menu.png" width="420" alt="baa in the menu bar">
 </picture>
 
 ## install
