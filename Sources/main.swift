@@ -45,8 +45,18 @@ struct Proc {
     let elapsed: Double, cpu: Double
     let exe: String, cmd: String
     var label = ""
+    var bytes = 0.0
     var base: String { (exe as NSString).lastPathComponent }
-    var bytes: Double { Double(rssKB) * 1024 }
+}
+
+// same number activity monitor shows. unlike rss it includes memory macOS has compressed,
+// which is exactly what idle leftovers turn into. only readable for your own processes
+func footprint(_ pid: Int) -> Double? {
+    var info = rusage_info_v4()
+    let ok = withUnsafeMutablePointer(to: &info) { ptr in
+        ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(Int32(pid), RUSAGE_INFO_V4, $0) }
+    }
+    return ok == 0 ? Double(info.ri_phys_footprint) : nil
 }
 
 // "[dd-][hh:]mm:ss[.cc]" -> seconds (works for both etime and cputime)
@@ -111,6 +121,7 @@ func readProcs() -> [Int: Proc] {
         let e = exe[pid] ?? String(f[6])
         var p = Proc(pid: pid, ppid: ppid, uid: uid, rssKB: rss, elapsed: secs(f[4]), cpu: secs(f[5]), exe: e, cmd: String(f[6]))
         p.label = label(e, p.cmd)
+        p.bytes = footprint(pid) ?? Double(rss) * 1024
         out[pid] = p
     }
     return out
@@ -445,6 +456,17 @@ final class Model: ObservableObject {
     @Published var minutesToRed: Double?
     @Published var toast: String?
     @Published var busy: Set<String> = []
+    @Published var muted = UserDefaults.standard.bool(forKey: "muted") {
+        didSet { UserDefaults.standard.set(muted, forKey: "muted") }
+    }
+    private var bleat: NSSound?
+
+    // the little baa when Free actually frees something
+    func baa() {
+        guard !muted, let url = Bundle.main.url(forResource: "baa", withExtension: "wav") else { return }
+        bleat = NSSound(contentsOf: url, byReference: true)
+        bleat?.play()
+    }
 
     var health: Health { .of(free: free, level: level, minutesToRed: minutesToRed) }
     private let engine = Engine()
@@ -541,6 +563,7 @@ final class Model: ObservableObject {
             _ = before
             DispatchQueue.main.async {
                 self.busy.remove(id)
+                self.baa()
                 self.flash("Freed \(size(f.bytes)) · \(f.title)")
                 self.tick(); self.rescan()
             }
@@ -556,6 +579,7 @@ final class Model: ObservableObject {
             Thread.sleep(forTimeInterval: 4.5)
             DispatchQueue.main.async {
                 self.busy.subtract(ids)
+                if !ids.isEmpty { self.baa() }
                 self.flash("Freed \(size(total))")
                 self.tick(); self.rescan()
             }
@@ -670,6 +694,10 @@ struct MenuView: View {
                     Button("Free all · \(size(m.scan.freeable))") { m.freeAll() }.buttonStyle(.bordered).controlSize(.small)
                 }
                 Spacer()
+                Button { m.muted.toggle() } label: {
+                    Image(systemName: m.muted ? "speaker.slash" : "speaker.wave.2").font(.system(size: 11))
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary).help(m.muted ? "baa sound off" : "baa sound on")
                 Button("Quit") { NSApp.terminate(nil) }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
@@ -707,6 +735,7 @@ enum CLI {
             DistributedNotificationCenter.default().postNotificationName(.init("com.selvi.baa.test"), object: nil, userInfo: nil, deliverImmediately: true)
             print("sent a test notification (Baa needs to be running in the menu bar)")
         case "--free", "free": free(rest.first ?? "")
+        case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"))
         default:
             print("baa            readout + leftovers\nbaa free <id>  free one leftover (or 'all')\nbaa test       sample notification")
         }
@@ -738,6 +767,33 @@ enum CLI {
         }
         if h != .ok { print("\n  \(b)→\(r) \(fixText(s.apps))") }
         print("")
+    }
+
+    // draws the real menu panel (live data) to a png, for the readme
+    static func snapshot(_ path: String, dark: Bool) {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        let look = NSAppearance(named: dark ? .darkAqua : .aqua)
+        app.appearance = look
+        let m = Model.shared
+        m.free = Mem.freePct; m.level = Mem.level; m.swap = Mem.swapGB
+        m.scan = Engine().scan()
+        let panel = MenuView()
+            .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .windowBackgroundColor)))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.1), lineWidth: 1))
+            .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+            .padding(36)
+        let host = NSHostingView(rootView: panel)
+        host.appearance = look
+        host.frame.size = host.fittingSize
+        let win = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        win.appearance = look; win.backgroundColor = .clear; win.isOpaque = false
+        win.contentView = host
+        host.layoutSubtreeIfNeeded(); host.display()
+        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { print("couldn't render"); return }
+        host.cacheDisplay(in: host.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+        print("saved \(path) (\(rep.pixelsWide)x\(rep.pixelsHigh))")
     }
 
     static func free(_ id: String) {

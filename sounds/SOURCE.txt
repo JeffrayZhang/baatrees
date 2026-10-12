@@ -1,0 +1,3 @@
+"Sheep bleat.ogg" by InverseHypercube, CC0 (public domain)
+https://commons.wikimedia.org/wiki/File:Sheep_bleat.ogg
+converted to mono wav + quieter (ffmpeg loudnorm I=-20)
