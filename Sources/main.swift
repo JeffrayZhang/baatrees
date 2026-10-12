@@ -377,6 +377,148 @@ func fixText(_ apps: [(name: String, gb: Double)]) -> String {
     return "close what you're done with"
 }
 
+// MARK: - disk
+
+// only known, rebuildable dev junk. never your files, xcode archives, or emulator images
+enum JunkAction { case trash([URL]), run([(String, [String])]) }
+
+struct Junk: Identifiable {
+    let id: String, icon: String, title: String, detail: String, bytes: Double, action: JunkAction
+    var blockedBy: String? = nil
+    var trashes: Bool { if case .trash = action { return true }; return false }
+}
+
+enum Disk {
+    static let home = FileManager.default.homeDirectoryForCurrentUser
+    static func h(_ p: String) -> URL { home.appendingPathComponent(p) }
+
+    static var free: Double {
+        let v = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return Double(v?.volumeAvailableCapacityForImportantUsage ?? 0)
+    }
+    static var total: Double {
+        let v = try? home.resourceValues(forKeys: [.volumeTotalCapacityKey])
+        return Double(v?.volumeTotalCapacity ?? 0)
+    }
+
+    static func exists(_ u: URL) -> Bool { FileManager.default.fileExists(atPath: u.path) }
+
+    static func du(_ urls: [URL]) -> Double {
+        let paths = urls.map(\.path).filter { FileManager.default.fileExists(atPath: $0) }
+        guard !paths.isEmpty else { return 0 }
+        return run("/usr/bin/du", ["-sk"] + paths).out.split(separator: "\n")
+            .compactMap { Double($0.split(separator: "\t").first ?? "") }.reduce(0, +) * 1024
+    }
+
+    static func modified(_ u: URL) -> Date {
+        (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    }
+
+    static func children(_ u: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(at: u, includingPropertiesForKeys: [.contentModificationDateKey],
+                                                      options: [.skipsHiddenFiles])) ?? []
+    }
+
+    // "2.3GB (45%)" -> bytes
+    static func parseSize(_ s: Substring) -> Double {
+        let t = s.split(separator: " ").first.map(String.init) ?? ""
+        let units: [(String, Double)] = [("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("kB", 1e3), ("B", 1)]
+        for (u, m) in units where t.hasSuffix(u) { return (Double(t.dropLast(u.count)) ?? 0) * m }
+        return 0
+    }
+
+    static func scan() -> [Junk] {
+        var out: [Junk] = []
+        let xcodeOpen = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dt.Xcode").isEmpty
+        let quitXcode = xcodeOpen ? "quit Xcode first" : nil
+        func add(_ id: String, _ icon: String, _ title: String, _ detail: String, _ urls: [URL], blocked: String? = nil) {
+            let urls = urls.filter(exists)
+            let b = du(urls)
+            guard b >= 200 * 1_048_576 else { return }
+            out.append(Junk(id: id, icon: icon, title: title, detail: detail, bytes: b, action: .trash(urls), blockedBy: blocked))
+        }
+
+        add("xcode-build", "🔨", "Xcode build files", "DerivedData · rebuilds on your next build",
+            [h("Library/Developer/Xcode/DerivedData")], blocked: quitXcode)
+
+        // device support: keep the newest version for each device model
+        var old: [URL] = []
+        for os in ["iOS", "watchOS", "tvOS", "visionOS"] {
+            let byModel = Dictionary(grouping: children(h("Library/Developer/Xcode/\(os) DeviceSupport"))) {
+                $0.lastPathComponent.split(separator: " ").first.map(String.init) ?? ""
+            }
+            for (_, dirs) in byModel { old += dirs.sorted { modified($0) > modified($1) }.dropFirst() }
+        }
+        add("device-support", "📲", "Old iOS device support", "versions your phone isn't on anymore · Xcode re-adds them if needed",
+            old, blocked: quitXcode)
+
+        // simulator runtimes: keep the newest per platform
+        if let data = run("/usr/bin/xcrun", ["simctl", "runtime", "list", "-j"]).out.data(using: .utf8),
+           let all = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] {
+            let rts = all.map { (id: $0.key, platform: $0.value["platformIdentifier"] as? String ?? "",
+                                 version: $0.value["version"] as? String ?? "", size: ($0.value["sizeBytes"] as? NSNumber)?.doubleValue ?? 0) }
+            var stale: [(id: String, platform: String, version: String, size: Double)] = []
+            for (_, group) in Dictionary(grouping: rts, by: { $0.platform }) {
+                stale += group.sorted { $0.version.compare($1.version, options: .numeric) == .orderedDescending }.dropFirst()
+            }
+            let bytes = stale.reduce(0) { $0 + $1.size }
+            if bytes >= 200 * 1_048_576 {
+                out.append(Junk(id: "sim-runtimes", icon: "📱", title: "Old simulator versions",
+                                detail: stale.map { "iOS \($0.version)" }.sorted().joined(separator: ", ") + " · keeps your newest one",
+                                bytes: bytes, action: .run(stale.map { ("/usr/bin/xcrun", ["simctl", "runtime", "delete", $0.id]) }),
+                                blockedBy: quitXcode))
+            }
+        }
+        add("sim-caches", "📱", "Simulator caches", "rebuild automatically", [h("Library/Developer/CoreSimulator/Caches")])
+
+        add("gradle", "🐘", "Gradle caches", "re-download on your next Android build",
+            [h(".gradle/caches"), h(".gradle/daemon"), h(".gradle/wrapper/dists")])
+        add("js", "📦", "npm / yarn / bun caches", "re-download next time you install",
+            [h(".npm/_cacache"), h("Library/Caches/Yarn"), h(".bun/install/cache")])
+        add("python", "🐍", "pip / uv caches", "re-download next time you install", [h("Library/Caches/pip"), h(".cache/uv")])
+        add("brew", "🍺", "Homebrew / CocoaPods / SwiftPM caches", "old downloads",
+            [h("Library/Caches/Homebrew"), h("Library/Caches/CocoaPods"), h("Library/Caches/org.swift.swiftpm")])
+        add("test-browsers", "🧪", "Test browsers (Playwright / Puppeteer)", "reinstall with npx playwright install",
+            [h("Library/Caches/ms-playwright"), h(".cache/puppeteer")])
+        add("hf", "🤗", "Hugging Face models", "download again if a script needs them", [h(".cache/huggingface/hub")])
+
+        // installers sitting in Downloads for over a week
+        let weekAgo = Date().addingTimeInterval(-7 * 86400)
+        let installers = children(h("Downloads")).filter { ["dmg", "pkg", "iso"].contains($0.pathExtension.lowercased()) && modified($0) < weekAgo }
+        add("installers", "💿", "Old installers in Downloads", "\(installers.count) .dmg / .pkg files, older than a week", installers)
+
+        // node_modules in projects nobody has touched in a month
+        let monthAgo = Date().addingTimeInterval(-30 * 86400)
+        let found = run("/usr/bin/find", [home.path, "-maxdepth", "5", "(", "-path", h("Library").path, "-o", "-name", ".*", ")", "-prune",
+                                         "-o", "-type", "d", "-name", "node_modules", "-print", "-prune"]).out
+        let stale = found.split(separator: "\n").map { URL(fileURLWithPath: String($0)) }.filter { nm in
+            let project = nm.deletingLastPathComponent()
+            let last = ([project] + children(project).filter { $0.lastPathComponent != "node_modules" }).map(modified).max() ?? .distantPast
+            return last < monthAgo
+        }
+        add("node-modules", "📦", "Old node_modules", "\(stale.count) projects untouched for 30+ days · npm install brings them back", stale)
+
+        // docker: whatever it says is reclaimable
+        if let cli = ["/usr/local/bin/docker", "/opt/homebrew/bin/docker", "/Applications/Docker.app/Contents/Resources/bin/docker"]
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            let r = run(cli, ["system", "df", "--format", "{{.Reclaimable}}"])
+            let bytes = r.status == 0 ? r.out.split(separator: "\n").map(parseSize).reduce(0, +) : 0
+            if bytes >= 200 * 1_048_576 {
+                out.append(Junk(id: "docker", icon: "🐳", title: "Docker leftovers", detail: "stopped containers, unused images, build cache",
+                                bytes: bytes, action: .run([(cli, ["system", "prune", "-f"])])))
+            }
+        }
+        return out.sorted { $0.bytes > $1.bytes }
+    }
+
+    static func clean(_ j: Junk) {
+        switch j.action {
+        case .trash(let urls): for u in urls { try? FileManager.default.trashItem(at: u, resultingItemURL: nil) }
+        case .run(let cmds): for (path, args) in cmds { run(path, args) }
+        }
+    }
+}
+
 // MARK: - health
 
 enum Health {
@@ -475,6 +617,12 @@ final class Model: ObservableObject {
     private var lastPing: (at: Date, level: Int)?
     private var trendPing: Date?
     private var ghostPings: [String: Date] = [:]
+    @Published var junk: [Junk] = []
+    @Published var diskFree = 0.0
+    var diskTotal = 0.0
+    private var lastDiskScan: Date?
+    private var diskPing: Date?
+    private let dq = DispatchQueue(label: "baa.disk")
 
     func start() {
         Notifier.shared.setup()
@@ -482,6 +630,8 @@ final class Model: ObservableObject {
         tick(); rescan()
         Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in self.tick() }
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in self.rescan() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { self.diskScan() }
+        Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { _ in self.diskScan() }
     }
 
     private func tick() {
@@ -586,6 +736,52 @@ final class Model: ObservableObject {
         }
     }
 
+    // disk junk: scanned in the background every 6h (and when you open the menu, if stale)
+    func diskScan(ifOlderThan age: TimeInterval = 0) {
+        if let l = lastDiskScan, Date().timeIntervalSince(l) < age { return }
+        lastDiskScan = Date()
+        dq.async {
+            let j = Disk.scan(), free = Disk.free, total = Disk.total
+            DispatchQueue.main.async {
+                self.junk = j; self.diskFree = free; self.diskTotal = total
+                self.diskLowPing()
+            }
+        }
+    }
+
+    // under 10% or 15 GB free -> one ping every 12h, with the biggest safe cleanup on it
+    private func diskLowPing() {
+        let now = Date()
+        guard diskTotal > 0, diskFree < max(diskTotal * 0.1, 15e9),
+              diskPing.map({ now.timeIntervalSince($0) > 12 * 3600 }) ?? true else { return }
+        diskPing = now
+        let title = "💾 Disk almost full · \(size(diskFree)) left"
+        if let j = junk.first(where: { $0.blockedBy == nil }) {
+            Notifier.shared.post(title, "\(size(junk.reduce(0) { $0 + $1.bytes })) of dev junk you can clear", "\(j.title): \(j.detail)",
+                                 button: "Clear \(size(j.bytes))") { self.clean(j.id) }
+        } else {
+            Notifier.shared.post(title, "", "open baa to see what you can clear")
+        }
+    }
+
+    func clean(_ id: String) {
+        busy.insert(id)
+        dq.async {
+            guard let j = Disk.scan().first(where: { $0.id == id }), j.blockedBy == nil else {
+                DispatchQueue.main.async { self.busy.remove(id); self.diskScan() }
+                return
+            }
+            Disk.clean(j)
+            DispatchQueue.main.async {
+                self.busy.remove(id)
+                self.baa()
+                self.flash(j.trashes ? "Moved \(size(j.bytes)) to the Trash · empty it to get the space back"
+                                     : "Cleared \(size(j.bytes)) · \(j.title)")
+                self.diskScan()
+            }
+        }
+    }
+
     private func flash(_ s: String) {
         toast = s
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { if self.toast == s { self.toast = nil } }
@@ -671,15 +867,48 @@ struct MenuView: View {
                             Text(f.kind == .ghost ? "👻" : f.kind == .agent ? "🤖" : "💤").font(.system(size: 14))
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(f.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
-                                Text(f.detail).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
+                                Text(f.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             Spacer(minLength: 6)
                             Button { m.free(f.id) } label: {
                                 Text(m.busy.contains(f.id) ? "Freeing…" : f.freeLabel).font(.system(size: 11, weight: .semibold)).monospacedDigit()
                             }
                             .buttonStyle(.borderedProminent).controlSize(.small).tint(f.kind == .idle ? .gray : .accentColor)
                             .disabled(m.busy.contains(f.id))
+                            .fixedSize().layoutPriority(1)
                         }
+                    }
+                }
+            }
+
+            Section_(title: "DISK", trailing: m.diskTotal > 0 ? "\(size(m.diskFree)) free" + (m.junk.isEmpty ? "" : " · \(size(m.junk.reduce(0) { $0 + $1.bytes })) junk") : nil) {
+                if m.junk.isEmpty {
+                    Text(m.diskTotal > 0 ? "No dev junk piling up ✨" : "Checking…").font(.system(size: 12)).foregroundStyle(.secondary)
+                } else {
+                    ForEach(m.junk.prefix(5)) { j in
+                        HStack(alignment: .center, spacing: 10) {
+                            Text(j.icon).font(.system(size: 14))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(j.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                                Text(j.blockedBy ?? j.detail).font(.system(size: 11))
+                                    .foregroundStyle(j.blockedBy == nil ? Color.secondary : Color.orange)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            Spacer(minLength: 6)
+                            Button { m.clean(j.id) } label: {
+                                Text(m.busy.contains(j.id) ? "Clearing…" : "\(j.trashes ? "Trash" : "Clear") \(size(j.bytes))")
+                                    .font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                            }
+                            .buttonStyle(.bordered).controlSize(.small)
+                            .disabled(m.busy.contains(j.id) || j.blockedBy != nil)
+                            .fixedSize().layoutPriority(1)
+                        }
+                    }
+                    if m.junk.count > 5 {
+                        Text("+\(m.junk.count - 5) more · run baa disk").font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -703,7 +932,8 @@ struct MenuView: View {
         }
         .padding(16)
         .frame(width: 360)
-        .onAppear { m.rescan() }
+        .fixedSize(horizontal: false, vertical: true)
+        .onAppear { m.rescan(); m.diskScan(ifOlderThan: 15 * 60) }
     }
 }
 
@@ -735,9 +965,10 @@ enum CLI {
             DistributedNotificationCenter.default().postNotificationName(.init("com.selvi.baa.test"), object: nil, userInfo: nil, deliverImmediately: true)
             print("sent a test notification (Baa needs to be running in the menu bar)")
         case "--free", "free": free(rest.first ?? "")
-        case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"))
+        case "disk": disk(rest)
+        case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"))
         default:
-            print("baa            readout + leftovers\nbaa free <id>  free one leftover (or 'all')\nbaa test       sample notification")
+            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa test             sample notification")
         }
     }
 
@@ -770,7 +1001,7 @@ enum CLI {
     }
 
     // draws the real menu panel (live data) to a png, for the readme
-    static func snapshot(_ path: String, dark: Bool) {
+    static func snapshot(_ path: String, dark: Bool, demo: Bool = false) {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         let look = NSAppearance(named: dark ? .darkAqua : .aqua)
@@ -778,6 +1009,16 @@ enum CLI {
         let m = Model.shared
         m.free = Mem.freePct; m.level = Mem.level; m.swap = Mem.swapGB
         m.scan = Engine().scan()
+        m.junk = Disk.scan(); m.diskFree = Disk.free; m.diskTotal = Disk.total
+        if demo {
+            // sample leftovers for readme screenshots (same two baa caught for real while testing)
+            m.scan.findings = [
+                Finding(id: "demo-1", kind: .ghost, title: "Python · build_index.py", detail: "its terminal or agent closed · idle 12m, running 12m",
+                        bytes: 404 * 1_048_576, fix: .kill([])),
+                Finding(id: "demo-2", kind: .agent, title: "Dev server :3000 · python", detail: "started by Claude Code (my-app) · idle 12m",
+                        bytes: 261 * 1_048_576, fix: .kill([])),
+            ] + m.scan.findings
+        }
         let panel = MenuView()
             .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .windowBackgroundColor)))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.1), lineWidth: 1))
@@ -794,6 +1035,35 @@ enum CLI {
         host.cacheDisplay(in: host.bounds, to: rep)
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
         print("saved \(path) (\(rep.pixelsWide)x\(rep.pixelsHigh))")
+    }
+
+    static func disk(_ rest: [String]) {
+        let g = "\u{1B}[90m", b = "\u{1B}[1m", r = "\u{1B}[0m"
+        let junk = Disk.scan()
+        if rest.first == "clean" {
+            let id = rest.dropFirst().first ?? ""
+            let picks = id == "all" ? junk.filter { $0.blockedBy == nil } : junk.filter { $0.id == id }
+            guard !picks.isEmpty else { print("nothing called '\(id)' right now. run baa disk to see ids"); return }
+            for j in picks {
+                if let why = j.blockedBy { print("skipped \(j.title): \(why)"); continue }
+                Disk.clean(j)
+                print(j.trashes ? "moved \(size(j.bytes)) to the Trash · \(j.title)" : "cleared \(size(j.bytes)) · \(j.title)")
+            }
+            if picks.contains(where: \.trashes) { print("\(g)empty the Trash to get the space back\(r)") }
+            return
+        }
+        let total = Disk.total, free = Disk.free, used = total > 0 ? Int((1 - free / total) * 100) : 0
+        let fill = used / 5
+        print("\n  \(b)DISK\(r)  \(size(free)) free of \(size(total))")
+        print("  \(String(repeating: "█", count: fill))\(g)\(String(repeating: "░", count: 20 - fill))\(r)  \(b)\(used)% used\(r)\n")
+        if junk.isEmpty { print("  no dev junk piling up ✨\n"); return }
+        print("  \(b)dev junk\(r)  \(g)· \(size(junk.reduce(0) { $0 + $1.bytes })) you can clear\(r)")
+        for j in junk {
+            print("  \(j.icon) \(b)\(j.title)\(r)  \(size(j.bytes))")
+            print("     \(g)\(j.blockedBy.map { "⚠︎ " + $0 } ?? j.detail)\(r)")
+            print("     \(g)→ baa disk clean \(j.id)\(r)")
+        }
+        print("")
     }
 
     static func free(_ id: String) {

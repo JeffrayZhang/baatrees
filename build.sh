@@ -4,7 +4,7 @@ set -e
 cd "${0:A:h}"
 APP=build/Baa.app
 rm -rf $APP && mkdir -p $APP/Contents/MacOS
-swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macos14 -o $APP/Contents/MacOS/Baa Sources/main.swift
+swiftc -O -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macos14" -o $APP/Contents/MacOS/Baa Sources/main.swift
 cp Info.plist $APP/Contents/
 mkdir -p $APP/Contents/Resources && cp icon/AppIcon.icns sounds/baa.wav $APP/Contents/Resources/
 codesign --force -s - $APP

@@ -4,11 +4,11 @@
 
 <img src="icon/icon_1024.png" width="128">
 
-tldr; baa lives in your menu bar, tells you when your mac is about to run out of RAM, finds the stuff quietly eating it, and frees it in one click.
+tldr; baa lives in your menu bar, tells you when your mac is about to run out of RAM or disk, finds the stuff quietly eating it, and frees it in one click.
 
 ## why
 
-i built this because my mac keeps running out of RAM every 2 hours and i typically get around this by closing random apps and hoping it will help (it usually doesn't).
+i built this because my mac keeps running out of RAM every 2 hours and i typically get around it by closing random apps and hoping it will help (it usually doesn't).
 
 baa 🐏 is a little ram that headbutts all of that out of your mac.
 
@@ -21,6 +21,7 @@ baa 🐏 is a little ram that headbutts all of that out of your mac.
   - 💤 big stuff just sitting there idle (agent sessions idle for hours, docker with no containers, an ollama model still loaded)
 - tells you how much RAM you'd get back, and frees it in one click
 - pings you a few minutes before you run out
+- also finds dev junk filling up your disk (old builds, package caches etc.) and trashes it in one click
 - plays a tiny baa when it frees something 🐑 (you can mute it but it's the best part imo)
 
 <picture>
@@ -46,6 +47,8 @@ that builds the app into `~/Applications`, starts it when you log in, and adds t
 | `baa` | RAM readout + leftovers, right in your terminal |
 | `baa free <id>` | free one leftover (ids are in the readout) |
 | `baa free all` | free everything it found |
+| `baa disk` | dev junk taking up your disk |
+| `baa disk clean <id>` | clear one (or `all`) |
 | `baa test` | send a sample notification |
 
 ## how it decides what's a leftover
