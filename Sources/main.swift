@@ -598,6 +598,11 @@ final class Model: ObservableObject {
     @Published var minutesToRed: Double?
     @Published var toast: String?
     @Published var busy: Set<String> = []
+    @Published var spark: [Int] = []          // free %, every 10s, last 30 min
+    @Published var shears = 0                 // bumps on every free, drives the wool burst
+    @Published var fresh = false              // just sheared: skinny sheep for a moment
+    @Published var freedToday = 0.0
+    @Published var freedAll = UserDefaults.standard.double(forKey: "freedAll")
     @Published var muted = UserDefaults.standard.bool(forKey: "muted") {
         didSet { UserDefaults.standard.set(muted, forKey: "muted") }
     }
@@ -611,12 +616,33 @@ final class Model: ObservableObject {
     }
 
     var health: Health { .of(free: free, level: level, minutesToRed: minutesToRed) }
+
+    // 0 = skinny sheep, 1 = giant fluffy cloud about to freeze your mac
+    var wool: Double { fresh ? 0 : min(1, max(0, Double(70 - free) / 60)) }
+
+    // baa + shear + keep score
+    private func sheared(_ bytes: Double) {
+        baa()
+        shears += 1; fresh = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self.fresh = false }
+        let d = UserDefaults.standard, day = Date().formatted(date: .numeric, time: .omitted)
+        if d.string(forKey: "freedDay") != day { d.set(day, forKey: "freedDay"); d.set(0.0, forKey: "freedToday") }
+        freedToday = d.double(forKey: "freedToday") + bytes; d.set(freedToday, forKey: "freedToday")
+        freedAll += bytes; d.set(freedAll, forKey: "freedAll")
+    }
+
+    private func loadToday() {
+        let d = UserDefaults.standard
+        freedToday = d.string(forKey: "freedDay") == Date().formatted(date: .numeric, time: .omitted) ? d.double(forKey: "freedToday") : 0
+    }
     private let engine = Engine()
     private let q = DispatchQueue(label: "baa.scan")
     private var history: [(at: Date, free: Int)] = []
     private var lastPing: (at: Date, level: Int)?
     private var trendPing: Date?
-    private var ghostPings: [String: Date] = [:]
+    // remembered across restarts so a relaunch doesn't re-ping the same leftover
+    private var ghostPings: [String: Date] = ((UserDefaults.standard.dictionary(forKey: "ghostPings") as? [String: Double]) ?? [:])
+        .mapValues { Date(timeIntervalSince1970: $0) }
     @Published var junk: [Junk] = []
     @Published var diskFree = 0.0
     var diskTotal = 0.0
@@ -626,6 +652,7 @@ final class Model: ObservableObject {
 
     func start() {
         Notifier.shared.setup()
+        loadToday()
         DistributedNotificationCenter.default().addObserver(forName: .init("com.selvi.baa.test"), object: nil, queue: .main) { _ in self.test() }
         tick(); rescan()
         Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in self.tick() }
@@ -638,6 +665,7 @@ final class Model: ObservableObject {
         free = Mem.freePct; level = Mem.level; swap = Mem.swapGB
         let now = Date()
         history.append((now, free))
+        spark.append(free); if spark.count > 180 { spark.removeFirst(spark.count - 180) }
         history.removeAll { now.timeIntervalSince($0.at) > 180 }
         trend()
         pressurePing()
@@ -693,7 +721,8 @@ final class Model: ObservableObject {
         guard let f = scan.findings.first(where: { $0.kind != .idle && $0.bytes >= 1_073_741_824 &&
                                                    ghostPings[$0.id].map { now.timeIntervalSince($0) > 6 * 3600 } ?? true }) else { return }
         ghostPings[f.id] = now
-        Notifier.shared.post("👻 \(f.title) is still running", f.detail, "Holding \(size(f.bytes)) you could have back", button: f.freeLabel) { self.free(f.id) }
+        UserDefaults.standard.set(ghostPings.mapValues(\.timeIntervalSince1970), forKey: "ghostPings")
+        Notifier.shared.post("👻 \(size(f.bytes)) still running", f.title, f.detail, button: f.freeLabel) { self.free(f.id) }
     }
 
     private func test() {
@@ -704,16 +733,14 @@ final class Model: ObservableObject {
     func free(_ id: String) {
         busy.insert(id)
         q.async {
-            let before = Double(Mem.freePct)
             guard let f = self.engine.scan().findings.first(where: { $0.id == id }) else {
                 DispatchQueue.main.async { self.busy.remove(id); self.rescan() }
                 return
             }
             apply(f, wait: true)
-            _ = before
             DispatchQueue.main.async {
                 self.busy.remove(id)
-                self.baa()
+                self.sheared(f.bytes)
                 self.flash("Freed \(size(f.bytes)) · \(f.title)")
                 self.tick(); self.rescan()
             }
@@ -729,7 +756,7 @@ final class Model: ObservableObject {
             Thread.sleep(forTimeInterval: 4.5)
             DispatchQueue.main.async {
                 self.busy.subtract(ids)
-                if !ids.isEmpty { self.baa() }
+                if !ids.isEmpty { self.sheared(total) }
                 self.flash("Freed \(size(total))")
                 self.tick(); self.rescan()
             }
@@ -774,7 +801,7 @@ final class Model: ObservableObject {
             Disk.clean(j)
             DispatchQueue.main.async {
                 self.busy.remove(id)
-                self.baa()
+                self.sheared(j.bytes)
                 self.flash(j.trashes ? "Moved \(size(j.bytes)) to the Trash · empty it to get the space back"
                                      : "Cleared \(size(j.bytes)) · \(j.title)")
                 self.diskScan()
@@ -788,19 +815,119 @@ final class Model: ObservableObject {
     }
 }
 
-// MARK: - menu
+// MARK: - sheep
 
-struct Bar: View {
-    let fraction: Double, color: Color
+// one drawing for both the menu bar (template silhouette) and the panel (colored)
+func drawSheep(_ c: inout GraphicsContext, _ sz: CGSize, wool w: Double, template: Bool, woolColor: Color = .white, ink: Color = .black) {
+    let k = min(sz.width / 100, sz.height / 80)
+    c.translateBy(x: (sz.width - 100 * k) / 2, y: (sz.height - 80 * k) / 2)
+    c.scaleBy(x: k, y: k)
+    let face = template ? Color.black : ink
+    let cx = 58.0, cy = 40.0, rx = 18 + 11 * w, ry = 12 + 6 * w, pr = 6 + 4 * w
+
+    // legs
+    for x in [cx - rx * 0.6, cx - rx * 0.25, cx + rx * 0.25, cx + rx * 0.6] {
+        c.fill(Path(roundedRect: CGRect(x: x - 2.6, y: cy + ry - 4, width: 5.2, height: 78 - cy - ry), cornerRadius: 2.6), with: .color(face))
+    }
+    // wool: a ring of puffs around an ellipse
+    var cloud = Path(ellipseIn: CGRect(x: cx - rx, y: cy - ry, width: rx * 2, height: ry * 2))
+    for i in 0..<14 {
+        let t = Double(i) / 14 * 2 * .pi
+        let px = cx + cos(t) * rx, py = cy + sin(t) * ry
+        cloud.addEllipse(in: CGRect(x: px - pr, y: py - pr, width: pr * 2, height: pr * 2))
+    }
+    if template {
+        c.fill(cloud, with: .color(.black))
+    } else {
+        c.fill(cloud, with: .color(woolColor))
+        c.stroke(cloud, with: .color(ink.opacity(0.18)), lineWidth: 1.2)
+        c.fill(Path(ellipseIn: CGRect(x: cx - rx + 1, y: cy - ry + 1, width: rx * 2 - 2, height: ry * 2 - 2)), with: .color(woolColor))
+    }
+    // head, sticking out the front of the wool
+    let hx = cx - rx - pr * 0.55, hy = cy - 4
+    let head = Path(ellipseIn: CGRect(x: hx - 9, y: hy - 11, width: 18, height: 22))
+    let ear = Path(ellipseIn: CGRect(x: hx + 4, y: hy - 9, width: 11, height: 6))
+    if template {
+        // cut a gap so the head reads as separate from the cloud
+        c.blendMode = .clear
+        c.stroke(head, with: .color(.black), lineWidth: 5)
+        c.blendMode = .normal
+    }
+    c.fill(ear, with: .color(face)); c.fill(head, with: .color(face))
+    // eye
+    if template { c.blendMode = .clear }
+    c.fill(Path(ellipseIn: CGRect(x: hx - 5.5, y: hy - 4, width: 4, height: 4)), with: .color(template ? .black : .white))
+    c.blendMode = .normal
+}
+
+struct Sheep: View, Animatable {
+    var wool: Double
+    var animatableData: Double { get { wool } set { wool = newValue } }
+    var color: Color = .white
+    @Environment(\.colorScheme) private var scheme
     var body: some View {
-        GeometryReader { g in
-            ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.08))
-                Capsule().fill(color.gradient).frame(width: max(4, g.size.width * min(1, fraction)))
+        // black face disappears on a dark panel, so it goes slate in dark mode
+        Canvas { c, sz in drawSheep(&c, sz, wool: wool, template: false, woolColor: color, ink: Color(white: scheme == .dark ? 0.5 : 0.22)) }
+    }
+}
+
+// wool puffs that fly off when you shear
+struct Burst: View {
+    let trigger: Int
+    @State private var t = 0.0
+    var body: some View {
+        ZStack {
+            ForEach(0..<9, id: \.self) { i in
+                let a = Double(i) / 9 * 2 * .pi + 0.3
+                Circle().fill(.white).overlay(Circle().stroke(Color.primary.opacity(0.15)))
+                    .frame(width: 9 + Double(i % 3) * 3, height: 9 + Double(i % 3) * 3)
+                    .offset(x: cos(a) * 54 * t, y: sin(a) * 40 * t - 18 * t * t)
+                    .opacity(t == 0 ? 0 : 1 - t)
+            }
+        }
+        .allowsHitTesting(false)
+        .onChange(of: trigger) {
+            t = 0.001
+            DispatchQueue.main.async { withAnimation(.easeOut(duration: 1.1)) { t = 1 } }
+        }
+    }
+}
+
+// last 30 min of RAM use, with a dotted line toward red when it's falling
+struct Spark: View {
+    let free: [Int], perMin: Double, minutesToRed: Double?, color: Color
+    var body: some View {
+        Canvas { c, sz in
+            let used = free.map { Double(100 - $0) }
+            guard used.count > 1 else { return }
+            let lo = max(0, (used.min() ?? 0) - 10), hi = 100.0
+            let span = Double(max(used.count, 30)), ahead = minutesToRed.map { min(60, $0 * 6) } ?? 0   // samples are 10s apart
+            let w = sz.width, h = sz.height
+            let x = { (i: Double) in w * i / (span + ahead) }
+            let y = { (v: Double) in h - h * (v - lo) / (hi - lo) }
+            let start = span - Double(used.count)   // stretches to whatever's been collected
+            // red line
+            var red = Path(); red.move(to: .init(x: 0, y: y(85))); red.addLine(to: .init(x: w, y: y(85)))
+            c.stroke(red, with: .color(.red.opacity(0.35)), style: .init(lineWidth: 1, dash: [2, 3]))
+            var line = Path()
+            for (i, v) in used.enumerated() {
+                let p = CGPoint(x: x(start + Double(i)), y: y(v))
+                i == 0 ? line.move(to: p) : line.addLine(to: p)
+            }
+            var fill = line
+            fill.addLine(to: .init(x: x(start + Double(used.count - 1)), y: h)); fill.addLine(to: .init(x: x(start), y: h)); fill.closeSubpath()
+            c.fill(fill, with: .linearGradient(Gradient(colors: [color.opacity(0.35), color.opacity(0.02)]), startPoint: .zero, endPoint: .init(x: 0, y: h)))
+            c.stroke(line, with: .color(color), style: .init(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
+            if ahead > 0, let last = used.last {
+                var p = Path()
+                p.move(to: .init(x: x(span - 1), y: y(last))); p.addLine(to: .init(x: w, y: y(85)))
+                c.stroke(p, with: .color(.red), style: .init(lineWidth: 1.6, lineCap: .round, dash: [3, 3]))
             }
         }
     }
 }
+
+// MARK: - menu
 
 struct Section_<Content: View>: View {
     let title: String, trailing: String?
@@ -817,101 +944,80 @@ struct Section_<Content: View>: View {
     }
 }
 
+struct Bar: View {
+    let fraction: Double, color: Color
+    var body: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.08))
+                Capsule().fill(color.gradient).frame(width: max(4, g.size.width * min(1, fraction)))
+            }
+        }
+    }
+}
+
+extension Finding {
+    // who left it running
+    var culprit: String {
+        if let r = detail.range(of: "started by ") {
+            let rest = detail[r.upperBound...]
+            return String(rest.prefix { $0 != "(" && $0 != "·" }).trimmingCharacters(in: .whitespaces)
+        }
+        return kind == .idle ? "Sitting idle" : "Left behind"
+    }
+    var emoji: String { kind == .ghost ? "👻" : kind == .agent ? "🤖" : "💤" }
+}
+
+func appIcon(_ name: String) -> NSImage? {
+    NSWorkspace.shared.runningApplications.first { $0.localizedName == name }?.icon
+}
+
+// what that process actually is, for names nobody recognizes
+func whatIs(_ name: String) -> String? {
+    let n = name.lowercased()
+    let table: [(String, String)] = [
+        ("chrome", "browser"), ("safari", "browser"), ("arc", "browser"), ("firefox", "browser"),
+        ("xcode", "iOS dev"), ("simulator", "iPhone simulator"), ("simmetalhost", "simulator graphics"),
+        ("android studio", "android dev"), ("emulator", "android emulator"), ("gradle", "android builds"), ("kotlin", "android builds"),
+        ("java", "runtime"), ("claude", "ai agent"), ("codex", "ai agent"), ("cursor", "code editor"), ("code", "code editor"),
+        ("docker", "containers"), ("virtual", "virtual machine"), ("ollama", "local ai model"), ("python", "script"), ("node", "javascript"),
+        ("spotify", "music"), ("slack", "chat"), ("discord", "chat"), ("zoom", "calls"), ("wispr", "dictation"),
+        ("windowserver", "draws your screen"), ("kernel", "macOS itself"), ("mds", "spotlight indexing"),
+    ]
+    return table.first { n.contains($0.0) }?.1
+}
+
 struct MenuView: View {
     @ObservedObject var m = Model.shared
+    @State var tab = 0
+    @State private var showLeftovers = false
 
-    var trendText: String {
-        if let t = m.minutesToRed { return String(format: "dropping %.0f%%/min · red in ~%d min", -m.perMin, max(1, Int(t.rounded()))) }
-        if m.perMin < -1.5 { return String(format: "dropping %.0f%%/min", -m.perMin) }
-        if m.perMin > 1.5 { return "recovering" }
-        return "steady"
+    var status: (title: String, line: String) {
+        switch m.health {
+        case .ok: return ("room to breathe", m.scan.findings.isEmpty ? "nothing to shear right now" : "no need to shear yet")
+        case .falling: return ("dropping fast", "you'll hit red in ~\(max(1, Int((m.minutesToRed ?? 1).rounded()))) min")
+        case .tight: return ("getting tight", m.scan.findings.isEmpty ? "close an app you're done with" : "shear the leftovers to make room")
+        case .critical: return ("about to freeze", m.scan.findings.isEmpty ? "close something big now" : "shear now")
+        }
     }
 
+    var groups: [(who: String, items: [Finding])] {
+        Dictionary(grouping: m.scan.findings, by: \.culprit)
+            .map { ($0.key, $0.value) }
+            .sorted { $0.1.reduce(0) { $0 + $1.bytes } > $1.1.reduce(0) { $0 + $1.bytes } }
+    }
+
+    var junkTotal: Double { m.junk.reduce(0) { $0 + $1.bytes } }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            // header
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .firstTextBaseline) {
-                    Circle().fill(m.health.color).frame(width: 9, height: 9)
-                    Text("RAM").font(.system(size: 15, weight: .bold))
-                    Text(m.health.word).font(.system(size: 15, weight: .medium)).foregroundStyle(m.health.color)
-                    Spacer()
-                    Text("\(m.free)% free").font(.system(size: 12, weight: .medium)).monospacedDigit().foregroundStyle(.secondary)
-                }
-                Bar(fraction: Double(100 - m.free) / 100, color: m.health.color).frame(height: 8)
-                HStack {
-                    Text(trendText)
-                    Spacer()
-                    Text(String(format: "swap %.1f GB", m.swap)).monospacedDigit()
-                }.font(.system(size: 11)).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 14) {
+            Picker("", selection: $tab) {
+                Text("Memory").tag(0)
+                Text("Disk").tag(1)
             }
+            .pickerStyle(.segmented).labelsHidden()
 
-            Section_(title: "USING THE MOST", trailing: nil) {
-                let top = m.scan.apps.first?.gb ?? 1
-                ForEach(m.scan.apps, id: \.name) { a in
-                    HStack(spacing: 10) {
-                        Text(a.name).font(.system(size: 12)).lineLimit(1).frame(width: 118, alignment: .leading)
-                        Bar(fraction: a.gb / top, color: m.health.color.opacity(0.75)).frame(height: 6)
-                        Text(String(format: "%.1f GB", a.gb)).font(.system(size: 11)).monospacedDigit()
-                            .foregroundStyle(.secondary).frame(width: 46, alignment: .trailing)
-                    }
-                }
-            }
-
-            Section_(title: "LEFTOVERS", trailing: m.scan.findings.isEmpty ? nil : "\(size(m.scan.freeable)) to free") {
-                if m.scan.findings.isEmpty {
-                    Text("Nothing to headbutt ✨").font(.system(size: 12)).foregroundStyle(.secondary)
-                } else {
-                    ForEach(m.scan.findings) { f in
-                        HStack(alignment: .center, spacing: 10) {
-                            Text(f.kind == .ghost ? "👻" : f.kind == .agent ? "🤖" : "💤").font(.system(size: 14))
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(f.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
-                                Text(f.detail).font(.system(size: 11)).foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            Spacer(minLength: 6)
-                            Button { m.free(f.id) } label: {
-                                Text(m.busy.contains(f.id) ? "Freeing…" : f.freeLabel).font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                            }
-                            .buttonStyle(.borderedProminent).controlSize(.small).tint(f.kind == .idle ? .gray : .accentColor)
-                            .disabled(m.busy.contains(f.id))
-                            .fixedSize().layoutPriority(1)
-                        }
-                    }
-                }
-            }
-
-            Section_(title: "DISK", trailing: m.diskTotal > 0 ? "\(size(m.diskFree)) free" + (m.junk.isEmpty ? "" : " · \(size(m.junk.reduce(0) { $0 + $1.bytes })) junk") : nil) {
-                if m.junk.isEmpty {
-                    Text(m.diskTotal > 0 ? "No dev junk piling up ✨" : "Checking…").font(.system(size: 12)).foregroundStyle(.secondary)
-                } else {
-                    ForEach(m.junk.prefix(5)) { j in
-                        HStack(alignment: .center, spacing: 10) {
-                            Text(j.icon).font(.system(size: 14))
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(j.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
-                                Text(j.blockedBy ?? j.detail).font(.system(size: 11))
-                                    .foregroundStyle(j.blockedBy == nil ? Color.secondary : Color.orange)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            Spacer(minLength: 6)
-                            Button { m.clean(j.id) } label: {
-                                Text(m.busy.contains(j.id) ? "Clearing…" : "\(j.trashes ? "Trash" : "Clear") \(size(j.bytes))")
-                                    .font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                            }
-                            .buttonStyle(.bordered).controlSize(.small)
-                            .disabled(m.busy.contains(j.id) || j.blockedBy != nil)
-                            .fixedSize().layoutPriority(1)
-                        }
-                    }
-                    if m.junk.count > 5 {
-                        Text("+\(m.junk.count - 5) more · run baa disk").font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
-                }
-            }
+            if tab == 0 { memory } else { disk }
 
             if let t = m.toast {
                 Text("✓ \(t)").font(.system(size: 12, weight: .medium)).foregroundStyle(.green)
@@ -919,9 +1025,8 @@ struct MenuView: View {
 
             Divider()
             HStack {
-                if m.scan.findings.count > 1 {
-                    Button("Free all · \(size(m.scan.freeable))") { m.freeAll() }.buttonStyle(.bordered).controlSize(.small)
-                }
+                Text(m.freedAll > 0 ? "🐑 baa'd \(size(m.freedToday)) today · \(size(m.freedAll)) all time" : "🐑 nothing baa'd yet")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
                 Spacer()
                 Button { m.muted.toggle() } label: {
                     Image(systemName: m.muted ? "speaker.slash" : "speaker.wave.2").font(.system(size: 11))
@@ -934,6 +1039,174 @@ struct MenuView: View {
         .frame(width: 360)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear { m.rescan(); m.diskScan(ifOlderThan: 15 * 60) }
+    }
+
+    // MARK: memory tab
+
+    @ViewBuilder var memory: some View {
+        // the sheep is the gauge
+        HStack(spacing: 14) {
+            ZStack {
+                Sheep(wool: m.wool).frame(width: 86, height: 68)
+                    .animation(.spring(response: 0.6, dampingFraction: 0.55), value: m.wool)
+                Burst(trigger: m.shears)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: 2) {
+                    Text("\(m.free)").font(.system(size: 30, weight: .bold, design: .rounded)).monospacedDigit()
+                    Text("% RAM free").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                }
+                HStack(spacing: 5) {
+                    Circle().fill(m.health.color).frame(width: 7, height: 7)
+                    Text(status.title).font(.system(size: 13, weight: .semibold)).foregroundStyle(m.health == .ok ? Color.primary : m.health.color)
+                }
+                Text(status.line).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+
+        VStack(alignment: .trailing, spacing: 3) {
+            Spark(free: m.spark, perMin: m.perMin, minutesToRed: m.minutesToRed, color: m.health.color)
+                .frame(height: 30)
+            Text("last \(max(1, m.spark.count / 6)) min · swap \(String(format: "%.1f", m.swap)) GB")
+                .font(.system(size: 9)).foregroundStyle(.tertiary)
+        }
+
+        if !m.scan.findings.isEmpty {
+            if m.health == .ok && !showLeftovers {
+                // healthy: leftovers stay out of your face
+                Button { withAnimation(.snappy) { showLeftovers = true } } label: {
+                    HStack {
+                        Text("🧶 \(m.scan.findings.count) leftover\(m.scan.findings.count == 1 ? "" : "s") you could shear")
+                        Spacer()
+                        Text(size(m.scan.freeable)).monospacedDigit().foregroundStyle(.secondary)
+                        Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.tertiary)
+                    }
+                    .font(.system(size: 12)).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            } else {
+                shearCard
+                leftovers
+            }
+        }
+
+        Section_(title: "USING THE MOST", trailing: nil) {
+            let top = m.scan.apps.first?.gb ?? 1
+            ForEach(m.scan.apps.prefix(5), id: \.name) { a in
+                HStack(spacing: 8) {
+                    Group {
+                        if let i = appIcon(a.name) { Image(nsImage: i).resizable() }
+                        else { Image(systemName: "gearshape.fill").resizable().padding(2).foregroundStyle(.secondary) }
+                    }.frame(width: 18, height: 18)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(a.name).font(.system(size: 12)).lineLimit(1)
+                        if let w = whatIs(a.name) { Text(w).font(.system(size: 10)).foregroundStyle(.secondary) }
+                    }
+                    .frame(width: 128, alignment: .leading)
+                    Bar(fraction: a.gb / top, color: m.health.color.opacity(0.75)).frame(height: 5)
+                    Text(String(format: "%.1f GB", a.gb)).font(.system(size: 11)).monospacedDigit()
+                        .foregroundStyle(.secondary).frame(width: 46, alignment: .trailing)
+                }
+            }
+        }
+    }
+
+    var shearCard: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(size(m.scan.freeable)).font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
+                Text("of wool to shear").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { m.freeAll() } label: {
+                Text(m.busy.isEmpty ? "✂️  Shear" : "Shearing…").font(.system(size: 13, weight: .semibold)).padding(.horizontal, 6)
+            }
+            .buttonStyle(.borderedProminent).controlSize(.large).disabled(!m.busy.isEmpty)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.accentColor.opacity(0.08)))
+    }
+
+    var leftovers: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(groups, id: \.who) { g in
+                VStack(alignment: .leading, spacing: 6) {
+                    let n = g.items.count, total = size(g.items.reduce(0) { $0 + $1.bytes })
+                    Text(g.items[0].kind == .agent ? "\(g.who) left \(n == 1 ? "this" : "these") · \(total)" : "\(g.who) · \(total)")
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                    ForEach(g.items) { f in
+                        HStack(alignment: .center, spacing: 10) {
+                            Text(f.emoji).font(.system(size: 14))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(f.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                                Text(f.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            Spacer(minLength: 6)
+                            Button { m.free(f.id) } label: {
+                                Text(m.busy.contains(f.id) ? "Freeing…" : f.freeLabel).font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                            }
+                            .buttonStyle(.bordered).controlSize(.small)
+                            .disabled(m.busy.contains(f.id))
+                            .fixedSize().layoutPriority(1)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: disk tab
+
+    @ViewBuilder var disk: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 3) {
+            Text(m.diskTotal > 0 ? String(format: "%.1f", m.diskFree / 1e9) : "…").font(.system(size: 30, weight: .bold, design: .rounded)).monospacedDigit()
+            Text("GB free").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+            Spacer()
+            if m.diskTotal > 0 {
+                Text("of \(size(m.diskTotal))").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+        if m.diskTotal > 0 {
+            Bar(fraction: 1 - m.diskFree / m.diskTotal, color: m.diskFree < max(m.diskTotal * 0.1, 15e9) ? .red : .accentColor).frame(height: 6)
+        }
+
+        if m.junk.isEmpty {
+            VStack(spacing: 4) {
+                Text("✨").font(.system(size: 20))
+                Text(m.diskTotal > 0 ? "nothing to clean up" : "checking…").font(.system(size: 12, weight: .semibold))
+                Text("no old builds or package caches piling up").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity).padding(.vertical, 12)
+        } else {
+            Section_(title: "DEV JUNK", trailing: "\(size(junkTotal)) you can clear") {
+                ForEach(m.junk.prefix(6)) { j in
+                    HStack(alignment: .center, spacing: 10) {
+                        Text(j.icon).font(.system(size: 14))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(j.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                            Text(j.blockedBy ?? j.detail).font(.system(size: 11))
+                                .foregroundStyle(j.blockedBy == nil ? Color.secondary : Color.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Spacer(minLength: 6)
+                        Button { m.clean(j.id) } label: {
+                            Text(m.busy.contains(j.id) ? "Clearing…" : "\(j.trashes ? "Trash" : "Clear") \(size(j.bytes))")
+                                .font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                        }
+                        .buttonStyle(.bordered).controlSize(.small)
+                        .disabled(m.busy.contains(j.id) || j.blockedBy != nil)
+                        .fixedSize().layoutPriority(1)
+                    }
+                }
+                if m.junk.count > 6 {
+                    Text("+\(m.junk.count - 6) more · run baa disk").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 }
 
@@ -966,7 +1239,7 @@ enum CLI {
             print("sent a test notification (Baa needs to be running in the menu bar)")
         case "--free", "free": free(rest.first ?? "")
         case "disk": disk(rest)
-        case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"))
+        case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"), disk: rest.contains("--disk"))
         default:
             print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa test             sample notification")
         }
@@ -1001,7 +1274,7 @@ enum CLI {
     }
 
     // draws the real menu panel (live data) to a png, for the readme
-    static func snapshot(_ path: String, dark: Bool, demo: Bool = false) {
+    static func snapshot(_ path: String, dark: Bool, demo: Bool = false, disk: Bool = false) {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         let look = NSAppearance(named: dark ? .darkAqua : .aqua)
@@ -1018,8 +1291,10 @@ enum CLI {
                 Finding(id: "demo-2", kind: .agent, title: "Dev server :3000 · python", detail: "started by Claude Code (my-app) · idle 12m",
                         bytes: 261 * 1_048_576, fix: .kill([])),
             ] + m.scan.findings
+            m.spark = (0..<180).map { (i: Int) -> Int in let x = Double(i); return Int(58.0 - x * 0.12 + sin(x / 7.0) * 3.0) }
+            m.freedToday = 2.3e9; m.freedAll = 48e9
         }
-        let panel = MenuView()
+        let panel = MenuView(tab: disk ? 1 : 0)
             .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .windowBackgroundColor)))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.1), lineWidth: 1))
             .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
