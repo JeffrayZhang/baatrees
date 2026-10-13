@@ -32,7 +32,8 @@ baa 🐏 is a little ram that headbutts all of that out of your mac.
 ## install
 
 ```sh
-brew install selviarora/tap/baa
+brew tap selviarora/baa https://github.com/selviarora/baa
+brew install selviarora/baa/baa
 brew services start baa
 ```
 
