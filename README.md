@@ -64,6 +64,17 @@ that builds the app into `~/Applications`, starts it when you log in, and adds t
 | `baa warn 20 10` | go 🟡 at 20% free and 🔴 at 10% (or tap the sliders icon in the panel) |
 | `baa test` | send a sample notification |
 
+## warning levels
+
+by default baa goes 🟡 at 15% RAM free and 🔴 at 8%. to change that, click 🐏 → the sliders icon at the bottom → set your own. or from the terminal:
+
+```sh
+baa warn 20 10   # 🟡 at 20% free, 🔴 at 10%
+baa warn         # see what it's set to
+```
+
+it'll still go 🔴 if macOS itself says memory is critical.
+
 ## how it decides what's a leftover
 
 basically baa looks for stuff that's still running but not doing anything:
@@ -75,6 +86,14 @@ basically baa looks for stuff that's still running but not doing anything:
 it also watches memory pressure (the green / yellow / red graph in activity monitor), not just how much RAM is used. macs use most of their RAM all the time and that's usually ok!
 
 it will also never kill anything on its own.
+
+## update
+
+```sh
+brew upgrade baa
+```
+
+or if you built it yourself: `git pull && ./install.sh`
 
 ## uninstall
 
