@@ -6,11 +6,13 @@
 
 tldr; baa lives in your menu bar, tells you when your mac is about to run out of RAM or disk, finds the stuff quietly eating it, and frees it in one click.
 
+<img src="docs/demo.gif" width="560" alt="baa: open the menu bar panel, shear the leftovers, RAM goes from 9% to 63% free">
+
 ## why
 
-i built this because my mac keeps running out of RAM every 2 hours and i typically get around it by closing random apps and hoping it will help (it usually doesn't).
+turns out most of my RAM wasn't going to apps i had open. it was mostly dev servers, builds and agent leftovers i'd forgotten about.
 
-baa 🐏 is a little ram that headbutts all of that out of your mac.
+**baa** 🐏 is a little ram that headbutts all of that out of your mac. it plays a tiny baa when it frees something (you can mute this if you hate whimsy though :P)
 
 ## what it does
 
@@ -22,12 +24,7 @@ baa 🐏 is a little ram that headbutts all of that out of your mac.
 - tells you how much RAM you'd get back, and frees it in one click
 - pings you a few minutes before you run out
 - also finds dev junk filling up your disk (old builds, package caches etc.) and trashes it in one click
-- plays a tiny baa when it frees something 🐑 (you can mute it but it's the best part imo)
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/menu-dark.png">
-  <img src="docs/menu.png" width="420" alt="baa in the menu bar">
-</picture>
 
 ## install
 
