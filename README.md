@@ -61,6 +61,7 @@ that builds the app into `~/Applications`, starts it when you log in, and adds t
 | `baa free all` | free everything it found |
 | `baa disk` | dev junk taking up your disk |
 | `baa disk clean <id>` | clear one (or `all`) |
+| `baa warn 20 10` | go 🟡 at 20% free and 🔴 at 10% (or tap the sliders icon in the panel) |
 | `baa test` | send a sample notification |
 
 ## how it decides what's a leftover

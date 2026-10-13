@@ -530,11 +530,18 @@ enum Health {
     private var index: Int { switch self { case .ok: 0; case .falling: 1; case .tight: 2; case .critical: 3 } }
 
     static func of(free: Int, level: Int, minutesToRed: Double?) -> Health {
-        if level >= 4 || free <= 8 { return .critical }
-        if level >= 2 || free <= 15 { return .tight }
+        if level >= 4 || free <= Limits.crit { return .critical }
+        if free <= Limits.warn { return .tight }   // yellow is only ever your number
         if let m = minutesToRed, m <= 5 { return .falling }
         return .ok
     }
+}
+
+// when to go yellow / red, in % free. set from the panel or `baa warn <yellow> [red]`
+enum Limits {
+    static var warn: Int { get { read("warnAt", 15) } set { UserDefaults.standard.set(newValue, forKey: "warnAt") } }
+    static var crit: Int { get { min(read("critAt", 8), warn - 1) } set { UserDefaults.standard.set(newValue, forKey: "critAt") } }
+    private static func read(_ k: String, _ d: Int) -> Int { UserDefaults.standard.object(forKey: k) as? Int ?? d }
 }
 
 // MARK: - notifications
@@ -601,8 +608,11 @@ final class Model: ObservableObject {
     @Published var spark: [Int] = []          // free %, every 10s, last 30 min
     @Published var shears = 0                 // bumps on every free, drives the wool burst
     @Published var fresh = false              // just sheared: skinny sheep for a moment
+    var filmWool: Double?, filmBurst: Double? // baa film: drive the sheep frame by frame
     @Published var freedToday = 0.0
     @Published var freedAll = UserDefaults.standard.double(forKey: "freedAll")
+    @Published var warnAt = Limits.warn { didSet { Limits.warn = warnAt; if critAt >= warnAt { critAt = warnAt - 1 } } }
+    @Published var critAt = Limits.crit { didSet { Limits.crit = critAt } }
     @Published var muted = UserDefaults.standard.bool(forKey: "muted") {
         didSet { UserDefaults.standard.set(muted, forKey: "muted") }
     }
@@ -618,7 +628,8 @@ final class Model: ObservableObject {
     var health: Health { .of(free: free, level: level, minutesToRed: minutesToRed) }
 
     // 0 = skinny sheep, 1 = giant fluffy cloud about to freeze your mac
-    var wool: Double { fresh ? 0 : min(1, max(0, Double(70 - free) / 60)) }
+    var wool: Double { filmWool ?? (fresh ? 0 : Model.woolFor(free)) }
+    static func woolFor(_ free: Int) -> Double { min(1, max(0, Double(70 - free) / 60)) }
 
     // baa + shear + keep score
     private func sheared(_ bytes: Double) {
@@ -638,7 +649,7 @@ final class Model: ObservableObject {
     private let engine = Engine()
     private let q = DispatchQueue(label: "baa.scan")
     private var history: [(at: Date, free: Int)] = []
-    private var lastPing: (at: Date, level: Int)?
+    private var lastPing: (at: Date, critical: Bool)?
     private var trendPing: Date?
     // remembered across restarts so a relaunch doesn't re-ping the same leftover
     private var ghostPings: [String: Date] = ((UserDefaults.standard.dictionary(forKey: "ghostPings") as? [String: Double]) ?? [:])
@@ -678,7 +689,7 @@ final class Model: ObservableObject {
         let n = Double(xs.count), mx = xs.reduce(0, +) / n, my = ys.reduce(0, +) / n
         let den = zip(xs, xs).map { ($0 - mx) * ($1 - mx) }.reduce(0, +)
         perMin = den > 0 ? zip(xs, ys).map { ($0 - mx) * ($1 - my) }.reduce(0, +) / den : 0
-        minutesToRed = (perMin < -1.5 && free > 15) ? Double(free - 15) / -perMin : nil
+        minutesToRed = (perMin < -1.5 && free > Limits.warn) ? Double(free - Limits.warn) / -perMin : nil
     }
 
     func rescan(then: (() -> Void)? = nil) {
@@ -703,8 +714,9 @@ final class Model: ObservableObject {
     private func pressurePing() {
         let now = Date(), h = health
         if h == .tight || h == .critical {
-            if let l = lastPing, level <= l.level, now.timeIntervalSince(l.at) < 1800 { return }
-            lastPing = (now, level)
+            // one ping per 30 min, unless it just got worse (yellow -> red)
+            if let l = lastPing, h != .critical || l.critical, now.timeIntervalSince(l.at) < 1800 { return }
+            lastPing = (now, h == .critical)
             pingWithBestFix("\(h.dot) RAM \(h.word) · \(free)% free")
         } else {
             lastPing = nil
@@ -875,14 +887,15 @@ struct Sheep: View, Animatable {
 struct Burst: View {
     let trigger: Int
     @State private var t = 0.0
+    var p: Double { Model.shared.filmBurst ?? t }
     var body: some View {
         ZStack {
             ForEach(0..<9, id: \.self) { i in
                 let a = Double(i) / 9 * 2 * .pi + 0.3
                 Circle().fill(.white).overlay(Circle().stroke(Color.primary.opacity(0.15)))
                     .frame(width: 9 + Double(i % 3) * 3, height: 9 + Double(i % 3) * 3)
-                    .offset(x: cos(a) * 54 * t, y: sin(a) * 40 * t - 18 * t * t)
-                    .opacity(t == 0 ? 0 : 1 - t)
+                    .offset(x: cos(a) * 54 * p, y: sin(a) * 40 * p - 18 * p * p)
+                    .opacity(p == 0 ? 0 : 1 - p)
             }
         }
         .allowsHitTesting(false)
@@ -991,6 +1004,28 @@ struct MenuView: View {
     @ObservedObject var m = Model.shared
     @State var tab = 0
     @State var showLeftovers = false
+    @State var showLimits = false
+
+    private func limitRow(_ dot: String, _ label: String, _ v: Binding<Int>, _ r: ClosedRange<Int>) -> some View {
+        HStack(spacing: 8) {
+            Text("\(dot) \(label)").font(.system(size: 12))
+            Spacer()
+            Text("\(v.wrappedValue)% free").font(.system(size: 12, weight: .semibold)).monospacedDigit()
+            Stepper("", value: v, in: r).labelsHidden().controlSize(.small)
+        }
+    }
+
+    var limits: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("WARN ME WHEN").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+            limitRow("🟡", "getting tight", $m.warnAt, 5...50)
+            limitRow("🔴", "critical", $m.critAt, 2...max(2, m.warnAt - 1))
+            Text("goes red anyway if macOS says memory is critical")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
+    }
 
     var status: (title: String, line: String) {
         switch m.health {
@@ -1023,6 +1058,8 @@ struct MenuView: View {
                 Text("✓ \(t)").font(.system(size: 12, weight: .medium)).foregroundStyle(.green)
             }
 
+            if showLimits { limits }
+
             Divider()
             HStack {
                 Text(m.freedAll > 0 ? "🐑 baa'd \(size(m.freedToday)) today · \(size(m.freedAll)) all time" : "🐑 nothing baa'd yet")
@@ -1032,6 +1069,10 @@ struct MenuView: View {
                     Image(systemName: m.muted ? "speaker.slash" : "speaker.wave.2").font(.system(size: 11))
                 }
                 .buttonStyle(.plain).foregroundStyle(.secondary).help(m.muted ? "baa sound off" : "baa sound on")
+                Button { withAnimation(.easeOut(duration: 0.2)) { showLimits.toggle() } } label: {
+                    Image(systemName: "slider.horizontal.3").font(.system(size: 11))
+                }
+                .buttonStyle(.plain).foregroundStyle(showLimits ? .primary : .secondary).help("warning levels")
                 Button("Quit") { NSApp.terminate(nil) }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
@@ -1239,10 +1280,20 @@ enum CLI {
             print("sent a test notification (Baa needs to be running in the menu bar)")
         case "--free", "free": free(rest.first ?? "")
         case "disk": disk(rest)
+        case "warn": warn(rest)
+        case "film": film(rest.first ?? "frames")
         case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"), disk: rest.contains("--disk"))
         default:
-            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa test             sample notification")
+            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa warn <y> [r]     go yellow / red at this % free\nbaa test             sample notification")
         }
+    }
+
+    static func warn(_ a: [String]) {
+        if let y = a.first.flatMap(Int.init), (5...50).contains(y) {
+            Limits.warn = y
+            if let r = a.dropFirst().first.flatMap(Int.init), r >= 2, r < y { Limits.crit = r }
+        } else if !a.isEmpty { print("usage: baa warn <yellow %> [red %]   e.g. baa warn 20 10"); return }
+        print("🟡 at \(Limits.warn)% free · 🔴 at \(Limits.crit)% free")
     }
 
     static func now() {
@@ -1295,7 +1346,7 @@ enum CLI {
             m.spark = (0..<180).map { (i: Int) -> Int in let x = Double(i); return Int(70.0 + x * 0.02 + sin(x / 9.0) * 2.5) }
             m.freedToday = 2.3e9; m.freedAll = 48e9
         }
-        let panel = MenuView(tab: disk ? 1 : 0, showLeftovers: demo)
+        let panel = MenuView(tab: disk ? 1 : 0, showLeftovers: demo, showLimits: ProcessInfo.processInfo.environment["BAA_SHOW_LIMITS"] != nil)
             .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .windowBackgroundColor)))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.1), lineWidth: 1))
             .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
@@ -1311,6 +1362,68 @@ enum CLI {
         host.cacheDisplay(in: host.bounds, to: rep)
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
         print("saved \(path) (\(rep.pixelsWide)x\(rep.pixelsHigh))")
+    }
+
+    // renders the panel frame by frame for the demo video (docs/make_video.py stitches it)
+    static func film(_ dir: String) {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        let look = NSAppearance(named: .aqua)
+        app.appearance = look
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let m = Model.shared
+        m.swap = 1.2; m.freedToday = 0; m.freedAll = 44.7e9
+        m.scan.apps = Array(Engine().scan().apps.prefix(3))
+        m.spark = (0..<180).map { (i: Int) -> Int in Int(74.0 + sin(Double(i) / 9.0) * 2.0) }
+        let ease = { (u: Double) -> Double in let x = min(1, max(0, u)); return x * x * (3 - 2 * x) }
+        let mb = 1_048_576.0
+        let found = [
+            Finding(id: "f1", kind: .ghost, title: "Gradle daemon", detail: "Android Studio closed 40m ago · still running", bytes: 1200 * mb, fix: .kill([])),
+            Finding(id: "f2", kind: .agent, title: "Dev server :3000 · python", detail: "started by Claude Code (my-app) · idle 12m", bytes: 261 * mb, fix: .kill([])),
+            Finding(id: "f3", kind: .ghost, title: "Python · build_index.py", detail: "its terminal or agent closed · idle 12m", bytes: 404 * mb, fix: .kill([])),
+        ]
+        var log = ""
+        var w0 = 0.0
+        for f in 0..<270 {
+            var free: Double
+            if f < 150 { free = 74 - 65 * ease(Double(f) / 150) }
+            else if f < 185 { free = 9 }
+            else { free = 9 + 54 * ease(Double(f - 185) / 40) }
+            m.free = Int(free.rounded())
+            m.level = m.free < 15 ? 4 : m.free < 30 ? 2 : 1
+            m.spark.append(m.free); m.spark.removeFirst()
+            if f < 150 && m.free > 15 { m.perMin = -6; m.minutesToRed = Double(m.free - 15) / 6 } else { m.perMin = f < 185 ? -0.5 : 4; m.minutesToRed = nil }
+            m.scan.findings = f >= 180 ? [] : Array(found.prefix(f >= 105 ? 3 : f >= 70 ? 2 : f >= 35 ? 1 : 0))
+            m.busy = (170..<180).contains(f) ? ["shearing"] : []
+            if f == 179 { w0 = m.wool }
+            if f >= 180 && f < 195 { m.filmWool = w0 * (1 - ease(Double(f - 180) / 15)) }
+            else if f >= 195 { m.filmWool = Model.woolFor(m.free) * ease(Double(f - 195) / 40) }
+            else { m.filmWool = nil }
+            m.filmBurst = f >= 180 && f < 214 ? max(0.001, Double(f - 180) / 34) : nil
+            m.toast = f >= 186 ? "Freed 1.8 GB · 3 leftovers" : nil
+            if f >= 186 { m.freedToday = 1.8e9 * 1.073741824; m.freedAll = 46.5e9 }
+            let panel = MenuView(tab: 0, showLeftovers: true)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .transaction { $0.disablesAnimations = true }
+            // measure at 1x, then draw scaled up so close-ups stay sharp (BAA_FILM_SCALE=2 -> 4x pixels)
+            let k = Double(ProcessInfo.processInfo.environment["BAA_FILM_SCALE"] ?? "1") ?? 1
+            let size = NSHostingView(rootView: panel).fittingSize
+            let host = NSHostingView(rootView: panel.scaleEffect(k, anchor: .topLeading)
+                .frame(width: size.width * k, height: size.height * k, alignment: .topLeading))
+            host.appearance = look
+            host.frame.size = CGSize(width: size.width * k, height: size.height * k)
+            let win = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            win.appearance = look; win.backgroundColor = .clear; win.isOpaque = false
+            win.contentView = host
+            host.layoutSubtreeIfNeeded(); host.display()
+            guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { continue }
+            host.cacheDisplay(in: host.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: String(format: "%@/p%04d.png", dir, f)))
+            log += "\(f) \(m.free) \(m.health == .ok ? "ok" : m.health.dot)\n"
+        }
+        try? log.write(toFile: dir + "/state.txt", atomically: true, encoding: .utf8)
+        print("rendered 270 frames to \(dir)")
     }
 
     static func disk(_ rest: [String]) {
