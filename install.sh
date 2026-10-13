@@ -21,6 +21,7 @@ cat > $AGENT <<PLIST
 PLIST
 launchctl bootout gui/$(id -u)/com.selvi.baa 2>/dev/null || true
 launchctl bootstrap gui/$(id -u) $AGENT
+launchctl kickstart -k gui/$(id -u)/com.selvi.baa
 
 mkdir -p ~/.local/bin
 printf '#!/bin/zsh\nexec ~/Applications/Baa.app/Contents/MacOS/Baa "${@:---now}"\n' > ~/.local/bin/baa

@@ -72,6 +72,8 @@ baa warn         # see what it's set to
 
 it'll still go 🔴 if macOS itself says memory is critical.
 
+the 🟠 "dropping fast" heads-up only fires when RAM keeps sliding and you're close to 🟡, not on every app launch. turn it off in the same place, or with `baa warn --no-trend`.
+
 ## how it decides what's a leftover
 
 basically baa looks for stuff that's still running but not doing anything:

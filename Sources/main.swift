@@ -541,6 +541,10 @@ enum Health {
 enum Limits {
     static var warn: Int { get { read("warnAt", 15) } set { UserDefaults.standard.set(newValue, forKey: "warnAt") } }
     static var crit: Int { get { min(read("critAt", 8), warn - 1) } set { UserDefaults.standard.set(newValue, forKey: "critAt") } }
+    static var trend: Bool {
+        get { UserDefaults.standard.object(forKey: "trendAlerts") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "trendAlerts") }
+    }
     private static func read(_ k: String, _ d: Int) -> Int { UserDefaults.standard.object(forKey: k) as? Int ?? d }
 }
 
@@ -613,6 +617,7 @@ final class Model: ObservableObject {
     @Published var freedAll = UserDefaults.standard.double(forKey: "freedAll")
     @Published var warnAt = Limits.warn { didSet { Limits.warn = warnAt; if critAt >= warnAt { critAt = warnAt - 1 } } }
     @Published var critAt = Limits.crit { didSet { Limits.crit = critAt } }
+    @Published var trendOn = Limits.trend { didSet { Limits.trend = trendOn; if !trendOn { minutesToRed = nil } } }
     @Published var muted = UserDefaults.standard.bool(forKey: "muted") {
         didSet { UserDefaults.standard.set(muted, forKey: "muted") }
     }
@@ -682,14 +687,23 @@ final class Model: ObservableObject {
         pressurePing()
     }
 
-    // least-squares slope over the last 3 min, in % free per minute
-    private func trend() {
-        guard history.count >= 8, let t0 = history.first?.at else { perMin = 0; minutesToRed = nil; return }
-        let xs = history.map { $0.at.timeIntervalSince(t0) / 60 }, ys = history.map { Double($0.free) }
+    // least-squares slope, in % free per minute
+    static func slope(_ pts: ArraySlice<(at: Date, free: Int)>) -> Double {
+        guard let t0 = pts.first?.at else { return 0 }
+        let xs = pts.map { $0.at.timeIntervalSince(t0) / 60 }, ys = pts.map { Double($0.free) }
         let n = Double(xs.count), mx = xs.reduce(0, +) / n, my = ys.reduce(0, +) / n
         let den = zip(xs, xs).map { ($0 - mx) * ($1 - mx) }.reduce(0, +)
-        perMin = den > 0 ? zip(xs, ys).map { ($0 - mx) * ($1 - my) }.reduce(0, +) / den : 0
-        minutesToRed = (perMin < -1.5 && free > Limits.warn) ? Double(free - Limits.warn) / -perMin : nil
+        return den > 0 ? zip(xs, ys).map { ($0 - mx) * ($1 - my) }.reduce(0, +) / den : 0
+    }
+
+    // "dropping fast" only when it's a real slide, not one app launch that already leveled off:
+    // falling over the last 3 min AND still falling in the last minute, and already within 10 points of yellow
+    private func trend() { (perMin, minutesToRed) = Model.trend(history, free: free, warn: Limits.warn, on: Limits.trend) }
+
+    static func trend(_ h: [(at: Date, free: Int)], free: Int, warn: Int, on: Bool) -> (Double, Double?) {
+        guard h.count >= 8 else { return (0, nil) }
+        let per = slope(h[...]), recent = slope(h.suffix(6)), gap = free - warn
+        return (per, (on && per < -1.5 && recent < -1.5 && gap > 0 && gap <= 10) ? Double(gap) / -per : nil)
     }
 
     func rescan(then: (() -> Void)? = nil) {
@@ -720,7 +734,7 @@ final class Model: ObservableObject {
             pingWithBestFix("\(h.dot) RAM \(h.word) · \(free)% free")
         } else {
             lastPing = nil
-            if h == .falling, let m = minutesToRed, trendPing.map({ now.timeIntervalSince($0) > 600 }) ?? true {
+            if h == .falling, let m = minutesToRed, trendPing.map({ now.timeIntervalSince($0) > 1800 }) ?? true {
                 trendPing = now
                 pingWithBestFix("🟠 RAM dropping fast · red in ~\(max(1, Int(m.rounded()))) min")
             }
@@ -1020,6 +1034,11 @@ struct MenuView: View {
             Text("WARN ME WHEN").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
             limitRow("🟡", "getting tight", $m.warnAt, 5...50)
             limitRow("🔴", "critical", $m.critAt, 2...max(2, m.warnAt - 1))
+            HStack(spacing: 8) {
+                Text("🟠 heads-up when it's dropping fast").font(.system(size: 12))
+                Spacer()
+                Toggle("", isOn: $m.trendOn).labelsHidden().toggleStyle(.switch).controlSize(.mini)
+            }
             Text("goes red anyway if macOS says memory is critical")
                 .font(.system(size: 10)).foregroundStyle(.tertiary)
         }
@@ -1284,16 +1303,20 @@ enum CLI {
         case "film": film(rest.first ?? "frames")
         case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"), disk: rest.contains("--disk"))
         default:
-            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa warn <y> [r]     go yellow / red at this % free\nbaa test             sample notification")
+            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa warn <y> [r]     go yellow / red at this % free\nbaa warn --no-trend  turn off the dropping-fast heads-up\nbaa test             sample notification")
         }
     }
 
     static func warn(_ a: [String]) {
+        if a.first == "--no-trend" || a.first == "--trend" {
+            Limits.trend = a.first == "--trend"
+            print(Limits.trend ? "🟠 dropping-fast heads-up on" : "🟠 dropping-fast heads-up off"); return
+        }
         if let y = a.first.flatMap(Int.init), (5...50).contains(y) {
             Limits.warn = y
             if let r = a.dropFirst().first.flatMap(Int.init), r >= 2, r < y { Limits.crit = r }
         } else if !a.isEmpty { print("usage: baa warn <yellow %> [red %]   e.g. baa warn 20 10"); return }
-        print("🟡 at \(Limits.warn)% free · 🔴 at \(Limits.crit)% free")
+        print("🟡 at \(Limits.warn)% free · 🔴 at \(Limits.crit)% free · 🟠 heads-up \(Limits.trend ? "on" : "off")")
     }
 
     static func now() {
@@ -1463,11 +1486,41 @@ enum CLI {
     }
 }
 
+// Both a login service and a direct launch can start Baa. A process lock keeps
+// those paths from creating two menu bar items for the same user.
+enum GUIInstance {
+    private static var lockFD: Int32 = -1
+
+    static func claim() -> Bool {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/com.selvi.baa", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            fputs("Baa: cannot create instance lock directory: \(error)\n", stderr)
+            return false
+        }
+
+        let fd = Darwin.open(directory.appendingPathComponent("instance.lock").path, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else {
+            perror("Baa: cannot open instance lock")
+            return false
+        }
+        guard Darwin.lockf(fd, F_TLOCK, 0) == 0 else {
+            Darwin.close(fd)
+            return false
+        }
+        lockFD = fd // Hold the lock until this process exits.
+        return true
+    }
+}
+
 @main
 struct Main {
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
         if let cmd = args.first { CLI.run(cmd, Array(args.dropFirst())); return }
+        guard GUIInstance.claim() else { return }
         BaaApp.main()
     }
 }
