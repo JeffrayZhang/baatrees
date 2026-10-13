@@ -31,7 +31,17 @@ baa 🐏 is a little ram that headbutts all of that out of your mac.
 
 ## install
 
-you'll need macOS 14+ and xcode command line tools (`xcode-select --install`).
+```sh
+brew install selviarora/tap/baa
+brew services start baa
+```
+
+that builds baa on your mac, starts it in your menu bar (and at every login), and adds the `baa` command. needs macOS 14+.
+
+<details>
+<summary>or build it yourself</summary>
+
+you'll need xcode command line tools (`xcode-select --install`).
 
 ```sh
 git clone https://github.com/selviarora/baa && cd baa
@@ -39,6 +49,7 @@ git clone https://github.com/selviarora/baa && cd baa
 ```
 
 that builds the app into `~/Applications`, starts it when you log in, and adds the `baa` command.
+</details>
 
 ## commands
 
@@ -64,6 +75,14 @@ it also watches memory pressure (the green / yellow / red graph in activity moni
 it will also never kill anything on its own.
 
 ## uninstall
+
+if you used brew:
+
+```sh
+brew services stop baa && brew uninstall baa
+```
+
+if you built it yourself:
 
 ```sh
 launchctl bootout gui/$(id -u)/com.selvi.baa
