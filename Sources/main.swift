@@ -21,8 +21,9 @@ enum Mem {
 }
 
 @discardableResult
-func run(_ path: String, _ args: [String]) -> (out: String, status: Int32) {
+func run(_ path: String, _ args: [String], in dir: String? = nil) -> (out: String, status: Int32) {
     let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
+    if let dir { p.currentDirectoryURL = URL(fileURLWithPath: dir) }
     let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
     do { try p.run() } catch { return ("", -1) }
     let d = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
@@ -380,12 +381,14 @@ func fixText(_ apps: [(name: String, gb: Double)]) -> String {
 // MARK: - disk
 
 // only known, rebuildable dev junk. never your files, xcode archives, or emulator images
-enum JunkAction { case trash([URL]), run([(String, [String])]) }
+enum JunkAction { case trash([URL]), run([(String, [String])]), tree(Worktree) }
 
 struct Junk: Identifiable {
     let id: String, icon: String, title: String, detail: String, bytes: Double, action: JunkAction
     var blockedBy: String? = nil
     var trashes: Bool { if case .trash = action { return true }; return false }
+    var isTree: Bool { if case .tree = action { return true }; return false }
+    var verb: String { trashes ? "Trash" : isTree ? "Remove" : "Clear" }
 }
 
 enum Disk {
@@ -508,14 +511,152 @@ enum Disk {
                                 bytes: bytes, action: .run([(cli, ["system", "prune", "-f"])])))
             }
         }
+        out += Trees.scan()
         return out.sorted { $0.bytes > $1.bytes }
     }
 
-    static func clean(_ j: Junk) {
+    // nil when it worked, otherwise why not
+    @discardableResult
+    static func clean(_ j: Junk) -> String? {
         switch j.action {
         case .trash(let urls): for u in urls { try? FileManager.default.trashItem(at: u, resultingItemURL: nil) }
         case .run(let cmds): for (path, args) in cmds { run(path, args) }
+        case .tree(let t): return Trees.remove(t)
         }
+        return nil
+    }
+}
+
+// MARK: - worktrees
+
+// git worktrees you stopped using. removing one deletes the checkout, never the branch (commits stay in the repo),
+// so a tree only gets a button when there's nothing else to lose: no uncommitted work, nothing off-branch, nothing running in it
+struct Worktree {
+    let name: String, path: String, repo: String, branch: String?, head: String, locked: Bool
+    var world: Bool { repo == Disk.h("world/git").path }
+    // world keeps per-tree build output (cargo target/) next to the checkout, in trees/<name>/
+    var dir: String { world && (path as NSString).lastPathComponent == "src" ? (path as NSString).deletingLastPathComponent : path }
+}
+
+enum Trees {
+    static let dev = "/opt/dev/bin/dev"
+
+    // fsmonitor would leave a watcher daemon behind in every stale tree we look at
+    @discardableResult
+    static func git(_ args: [String]) -> (out: String, status: Int32) { run("/usr/bin/git", ["-c", "core.fsmonitor=false"] + args) }
+
+    // repos with linked worktrees: world's shared one, plus anything in the usual code folders
+    static func repos() -> [String] {
+        var out = [Disk.h("world/git").path].filter { FileManager.default.fileExists(atPath: $0 + "/worktrees") }
+        let roots = ["src", "code", "Code", "dev", "Developer", "projects", "repos", "git", "work"].map(Disk.h).filter(Disk.exists).map(\.path)
+        guard !roots.isEmpty else { return out }
+        out += run("/usr/bin/find", roots + ["-maxdepth", "5", "(", "-name", "node_modules", "-o", "-name", "vendor", ")", "-prune",
+                                             "-o", "-type", "d", "-path", "*/.git/worktrees", "-print"]).out
+            .split(separator: "\n").map { (String($0) as NSString).deletingLastPathComponent }
+        return out
+    }
+
+    static func list(_ repo: String) -> [Worktree] {
+        // the first entry is the main checkout (or the bare repo itself), never a candidate
+        git(["--git-dir", repo, "worktree", "list", "--porcelain"]).out.components(separatedBy: "\n\n").dropFirst().compactMap { block in
+            var path = "", head = "", branch: String?, locked = false
+            for l in block.split(separator: "\n") {
+                if l.hasPrefix("worktree ") { path = String(l.dropFirst(9)) }
+                else if l.hasPrefix("HEAD ") { head = String(l.dropFirst(5)) }
+                else if l.hasPrefix("branch refs/heads/") { branch = String(l.dropFirst(18)) }
+                else if l.hasPrefix("locked") { locked = true }
+                else if l.hasPrefix("prunable") { return nil } // its folder is already gone
+            }
+            guard !path.isEmpty else { return nil }
+            let last = (path as NSString).lastPathComponent
+            let name = last == "src" ? ((path as NSString).deletingLastPathComponent as NSString).lastPathComponent : last
+            return Worktree(name: name, path: path, repo: repo, branch: branch, head: head, locked: locked)
+        }
+    }
+
+    // git's private folder for one tree: its HEAD, reflog, and any rebase in progress
+    static func admin(_ path: String) -> String? {
+        guard let s = try? String(contentsOfFile: path + "/.git", encoding: .utf8), s.hasPrefix("gitdir: ") else { return nil }
+        let d = s.dropFirst(8).trimmingCharacters(in: .whitespacesAndNewlines)
+        return d.hasPrefix("/") ? d : (path as NSString).appendingPathComponent(d)
+    }
+
+    // last commit / checkout / reset in it. not the index: `git status` rewrites that, so looking would count as using
+    static func lastUsed(_ t: Worktree) -> Date {
+        let commit = Double(git(["-C", t.path, "log", "-1", "--format=%ct"]).out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+        let reflog = admin(t.path).map { Disk.modified(URL(fileURLWithPath: $0 + "/logs/HEAD")) } ?? .distantPast
+        return max(Date(timeIntervalSince1970: commit), reflog)
+    }
+
+    // where each of your processes is sitting (shells, agents, servers)
+    static func cwds() -> [(cmd: String, dir: String)] {
+        var out: [(cmd: String, dir: String)] = [], cmd = ""
+        for l in run("/usr/sbin/lsof", ["-a", "-u", "\(getuid())", "-d", "cwd", "-Fcn"]).out.split(separator: "\n") {
+            if l.hasPrefix("c") { cmd = String(l.dropFirst()) }
+            else if l.hasPrefix("n") { out.append((cmd, String(l.dropFirst()))) }
+        }
+        return out
+    }
+
+    // what removing it would cost you, or nil if nothing. anything we can't check counts as a reason
+    static func blocker(_ t: Worktree, _ cwds: [(cmd: String, dir: String)]) -> String? {
+        if t.locked { return "locked · git worktree unlock to allow" }
+        if let p = cwds.first(where: { $0.dir == t.dir || $0.dir.hasPrefix(t.dir + "/") }) { return "\(p.cmd) is running in it" }
+        guard let a = admin(t.path) else { return "git couldn't read it" }
+        let ops = [("rebase-merge", "rebase"), ("rebase-apply", "rebase"), ("MERGE_HEAD", "merge"),
+                   ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert"), ("BISECT_LOG", "bisect")]
+        if let op = ops.first(where: { FileManager.default.fileExists(atPath: a + "/" + $0.0) }) { return "in the middle of a \(op.1)" }
+        // staged work first: it stops at the first difference, where status would list all 38k of them
+        switch git(["-C", t.path, "diff-index", "--cached", "--quiet", "HEAD"]).status {
+        case 0: break
+        case 1: return "staged changes not committed yet"
+        default: return "git couldn't read it"
+        }
+        let st = git(["-C", t.path, "status", "--porcelain", "--untracked-files=normal"])
+        guard st.status == 0 else { return "git couldn't read it" }
+        let n = st.out.split(separator: "\n").count
+        if n > 0 { return "\(n) uncommitted change\(n == 1 ? "" : "s")" }
+        // a detached HEAD is what keeps its commits alive. if no branch has them too, removing the tree orphans them
+        if t.branch == nil, git(["-C", t.path, "for-each-ref", "--contains", "HEAD", "--count=1", "refs/heads", "refs/remotes"]).out.isEmpty {
+            return "detached at \(t.head.prefix(7)), not on any branch"
+        }
+        return nil
+    }
+
+    // trees untouched for Limits.treeDays. never root or a main/master checkout
+    static func scan() -> [Junk] {
+        let now = Date(), stale = Double(Limits.treeDays) * 86400, inUse = cwds()
+        // a stale tree doesn't change, so its size is remembered until it gets used again
+        let cached = UserDefaults.standard.dictionary(forKey: "treeSizes") as? [String: Double] ?? [:]
+        var sizes: [String: Double] = [:], out: [Junk] = []
+        for t in repos().flatMap(list) where t.name != "root" && !["main", "master"].contains(t.branch ?? "") && Disk.exists(URL(fileURLWithPath: t.path)) {
+            let used = lastUsed(t), idle = now.timeIntervalSince(used)
+            guard idle >= stale else { continue }
+            let key = "\(t.dir)@\(Int(used.timeIntervalSince1970))"
+            let b = cached[key] ?? Disk.du([URL(fileURLWithPath: t.dir)])
+            sizes[key] = b
+            guard b >= 200 * 1_048_576 else { continue }
+            var id = "tree-\(t.name)"
+            if out.contains(where: { $0.id == id }) { id += "-" + ((t.repo as NSString).deletingLastPathComponent as NSString).lastPathComponent }
+            out.append(Junk(id: id, icon: "🌳", title: t.name,
+                            detail: (t.branch.map { "worktree on \($0)" } ?? "detached worktree") + " · untouched \(dur(idle)) · commits stay in git",
+                            bytes: b, action: .tree(t), blockedBy: blocker(t, inUse)))
+        }
+        UserDefaults.standard.set(sizes, forKey: "treeSizes")
+        return out
+    }
+
+    // world trees go through `dev tree remove`, which also stops the tree's servers and resets its databases.
+    // anything else is `git worktree remove`, which refuses on its own if something changed since we looked
+    static func remove(_ t: Worktree) -> String? {
+        if let why = blocker(t, cwds()) { return why } // look again right before deleting
+        let elsewhere = list(t.repo).map(\.path).first { $0 != t.path && Disk.exists(URL(fileURLWithPath: $0)) }
+        let viaDev = t.world && elsewhere != nil && FileManager.default.isExecutableFile(atPath: dev)
+        if viaDev { run(dev, ["tree", "remove", t.name, "--yes"], in: elsewhere) }
+        else { git(["--git-dir", t.repo, "worktree", "remove", t.path]) }
+        // dev exits 0 even when it refuses, so trust the folder, not the exit code
+        guard Disk.exists(URL(fileURLWithPath: t.path)) else { return nil }
+        return "couldn't remove it · try " + (viaDev ? "dev tree remove \(t.name)" : "git worktree remove \(t.path)")
     }
 }
 
@@ -545,6 +686,8 @@ enum Limits {
         get { UserDefaults.standard.object(forKey: "trendAlerts") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "trendAlerts") }
     }
+    // a worktree counts as old after this many days untouched. `baa trees days <n>`
+    static var treeDays: Int { get { read("treeDays", 14) } set { UserDefaults.standard.set(newValue, forKey: "treeDays") } }
     private static func read(_ k: String, _ d: Int) -> Int { UserDefaults.standard.object(forKey: k) as? Int ?? d }
 }
 
@@ -608,6 +751,7 @@ final class Model: ObservableObject {
     @Published var perMin = 0.0
     @Published var minutesToRed: Double?
     @Published var toast: String?
+    @Published var toastOK = true
     @Published var busy: Set<String> = []
     @Published var spark: [Int] = []          // free %, every 10s, last 30 min
     @Published var shears = 0                 // bumps on every free, drives the wool burst
@@ -811,7 +955,7 @@ final class Model: ObservableObject {
         let title = "💾 Disk almost full · \(size(diskFree)) left"
         if let j = junk.first(where: { $0.blockedBy == nil }) {
             Notifier.shared.post(title, "\(size(junk.reduce(0) { $0 + $1.bytes })) of dev junk you can clear", "\(j.title): \(j.detail)",
-                                 button: "Clear \(size(j.bytes))") { self.clean(j.id) }
+                                 button: "\(j.verb) \(size(j.bytes))") { self.clean(j.id) }
         } else {
             Notifier.shared.post(title, "", "open baa to see what you can clear")
         }
@@ -824,19 +968,20 @@ final class Model: ObservableObject {
                 DispatchQueue.main.async { self.busy.remove(id); self.diskScan() }
                 return
             }
-            Disk.clean(j)
+            let err = Disk.clean(j)
             DispatchQueue.main.async {
                 self.busy.remove(id)
+                if let err { self.flash("Kept \(j.title): \(err)", ok: false); self.diskScan(); return }
                 self.sheared(j.bytes)
                 self.flash(j.trashes ? "Moved \(size(j.bytes)) to the Trash · empty it to get the space back"
-                                     : "Cleared \(size(j.bytes)) · \(j.title)")
+                                     : "\(j.isTree ? "Removed" : "Cleared") \(size(j.bytes)) · \(j.title)")
                 self.diskScan()
             }
         }
     }
 
-    private func flash(_ s: String) {
-        toast = s
+    private func flash(_ s: String, ok: Bool = true) {
+        toast = s; toastOK = ok
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { if self.toast == s { self.toast = nil } }
     }
 }
@@ -1061,7 +1206,12 @@ struct MenuView: View {
             .sorted { $0.1.reduce(0) { $0 + $1.bytes } > $1.1.reduce(0) { $0 + $1.bytes } }
     }
 
-    var junkTotal: Double { m.junk.reduce(0) { $0 + $1.bytes } }
+    var devJunk: [Junk] { m.junk.filter { !$0.isTree } }
+    var junkTotal: Double { devJunk.reduce(0) { $0 + $1.bytes } }
+    // ones you can remove first, then the ones with changes in them
+    var trees: [Junk] {
+        m.junk.filter(\.isTree).sorted { ($0.blockedBy == nil) != ($1.blockedBy == nil) ? $0.blockedBy == nil : $0.bytes > $1.bytes }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1074,7 +1224,8 @@ struct MenuView: View {
             if tab == 0 { memory } else { disk }
 
             if let t = m.toast {
-                Text("✓ \(t)").font(.system(size: 12, weight: .medium)).foregroundStyle(.green)
+                Text(m.toastOK ? "✓ \(t)" : "⚠︎ \(t)").font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(m.toastOK ? Color.green : Color.orange)
             }
 
             if showLimits { limits }
@@ -1241,31 +1392,44 @@ struct MenuView: View {
             }
             .frame(maxWidth: .infinity).padding(.vertical, 12)
         } else {
-            Section_(title: "DEV JUNK", trailing: "\(size(junkTotal)) you can clear") {
-                ForEach(m.junk.prefix(6)) { j in
-                    HStack(alignment: .center, spacing: 10) {
-                        Text(j.icon).font(.system(size: 14))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(j.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
-                            Text(j.blockedBy ?? j.detail).font(.system(size: 11))
-                                .foregroundStyle(j.blockedBy == nil ? Color.secondary : Color.orange)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        Spacer(minLength: 6)
-                        Button { m.clean(j.id) } label: {
-                            Text(m.busy.contains(j.id) ? "Clearing…" : "\(j.trashes ? "Trash" : "Clear") \(size(j.bytes))")
-                                .font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                        }
-                        .buttonStyle(.bordered).controlSize(.small)
-                        .disabled(m.busy.contains(j.id) || j.blockedBy != nil)
-                        .fixedSize().layoutPriority(1)
+            if !devJunk.isEmpty {
+                Section_(title: "DEV JUNK", trailing: "\(size(junkTotal)) you can clear") {
+                    ForEach(devJunk.prefix(6)) { junkRow($0) }
+                    if devJunk.count > 6 {
+                        Text("+\(devJunk.count - 6) more · run baa disk").font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }
-                if m.junk.count > 6 {
-                    Text("+\(m.junk.count - 6) more · run baa disk").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            if !trees.isEmpty {
+                let safe = trees.filter { $0.blockedBy == nil }.reduce(0) { $0 + $1.bytes }
+                Section_(title: "OLD WORKTREES", trailing: safe > 0 ? "\(size(safe)) safe to remove" : "all have changes in them") {
+                    ForEach(trees.prefix(6)) { junkRow($0) }
+                    if trees.count > 6 {
+                        Text("+\(trees.count - 6) more · run baa trees").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
                 }
             }
+        }
+    }
+
+    func junkRow(_ j: Junk) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Text(j.icon).font(.system(size: 14))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(j.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                Text(j.blockedBy ?? j.detail).font(.system(size: 11))
+                    .foregroundStyle(j.blockedBy == nil ? Color.secondary : Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Spacer(minLength: 6)
+            Button { m.clean(j.id) } label: {
+                Text(m.busy.contains(j.id) ? (j.isTree ? "Removing…" : "Clearing…") : "\(j.verb) \(size(j.bytes))")
+                    .font(.system(size: 11, weight: .semibold)).monospacedDigit()
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+            .disabled(m.busy.contains(j.id) || j.blockedBy != nil)
+            .fixedSize().layoutPriority(1)
         }
     }
 }
@@ -1299,11 +1463,12 @@ enum CLI {
             print("sent a test notification (Baa needs to be running in the menu bar)")
         case "--free", "free": free(rest.first ?? "")
         case "disk": disk(rest)
+        case "trees": trees(rest)
         case "warn": warn(rest)
         case "film": film(rest.first ?? "frames")
         case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"), disk: rest.contains("--disk"))
         default:
-            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa warn <y> [r]     go yellow / red at this % free\nbaa warn --no-trend  turn off the dropping-fast heads-up\nbaa test             sample notification")
+            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa trees            old git worktrees taking up disk\nbaa trees clean <id> remove one (or 'all' the safe ones)\nbaa trees days <n>   count a tree as old after n days (default 14)\nbaa warn <y> [r]     go yellow / red at this % free\nbaa warn --no-trend  turn off the dropping-fast heads-up\nbaa test             sample notification")
         }
     }
 
@@ -1453,15 +1618,9 @@ enum CLI {
         let g = "\u{1B}[90m", b = "\u{1B}[1m", r = "\u{1B}[0m"
         let junk = Disk.scan()
         if rest.first == "clean" {
+            // 'all' means caches, like it always has. worktrees go one at a time here, or `baa trees clean all`
             let id = rest.dropFirst().first ?? ""
-            let picks = id == "all" ? junk.filter { $0.blockedBy == nil } : junk.filter { $0.id == id }
-            guard !picks.isEmpty else { print("nothing called '\(id)' right now. run baa disk to see ids"); return }
-            for j in picks {
-                if let why = j.blockedBy { print("skipped \(j.title): \(why)"); continue }
-                Disk.clean(j)
-                print(j.trashes ? "moved \(size(j.bytes)) to the Trash · \(j.title)" : "cleared \(size(j.bytes)) · \(j.title)")
-            }
-            if picks.contains(where: \.trashes) { print("\(g)empty the Trash to get the space back\(r)") }
+            clean(id == "all" ? junk.filter { !$0.isTree } : junk, id, list: "baa disk")
             return
         }
         let total = Disk.total, free = Disk.free, used = total > 0 ? Int((1 - free / total) * 100) : 0
@@ -1474,6 +1633,44 @@ enum CLI {
             print("  \(j.icon) \(b)\(j.title)\(r)  \(size(j.bytes))")
             print("     \(g)\(j.blockedBy.map { "⚠︎ " + $0 } ?? j.detail)\(r)")
             print("     \(g)→ baa disk clean \(j.id)\(r)")
+        }
+        print("")
+    }
+
+    // `clean <id>` or `clean all` over whatever a scan found
+    static func clean(_ junk: [Junk], _ id: String, list: String) {
+        let g = "\u{1B}[90m", r = "\u{1B}[0m"
+        let picks = id == "all" ? junk.filter { $0.blockedBy == nil } : junk.filter { $0.id == id }
+        guard !picks.isEmpty else { print("nothing called '\(id)' right now. run \(list) to see ids"); return }
+        for j in picks {
+            if let why = j.blockedBy { print("skipped \(j.title): \(why)"); continue }
+            if j.isTree { print("\(g)removing \(j.title)…\(r)") } // a big checkout takes a minute
+            if let err = Disk.clean(j) { print("kept \(j.title): \(err)"); continue }
+            print(j.trashes ? "moved \(size(j.bytes)) to the Trash · \(j.title)" : "\(j.isTree ? "removed" : "cleared") \(size(j.bytes)) · \(j.title)")
+        }
+        if picks.contains(where: \.trashes) { print("\(g)empty the Trash to get the space back\(r)") }
+    }
+
+    static func trees(_ rest: [String]) {
+        let g = "\u{1B}[90m", b = "\u{1B}[1m", r = "\u{1B}[0m", o = "\u{1B}[33m"
+        if rest.first == "days" {
+            if let d = rest.dropFirst().first.flatMap(Int.init), d >= 1 { Limits.treeDays = d }
+            else if rest.count > 1 { print("usage: baa trees days <n>   e.g. baa trees days 30"); return }
+            print("a worktree counts as old after \(Limits.treeDays) days untouched"); return
+        }
+        let trees = Trees.scan().sorted { ($0.blockedBy == nil) != ($1.blockedBy == nil) ? $0.blockedBy == nil : $0.bytes > $1.bytes }
+        if rest.first == "clean" { clean(trees, rest.dropFirst().first ?? "", list: "baa trees"); return }
+        let safe = trees.filter { $0.blockedBy == nil }.reduce(0) { $0 + $1.bytes }
+        print("\n  \(b)old worktrees\(r)  \(g)· untouched \(Limits.treeDays)+ days · \(size(safe)) safe to remove\(r)")
+        if trees.isEmpty { print("  none ✨\n"); return }
+        for j in trees {
+            print("  \(j.icon) \(b)\(j.title)\(r)  \(size(j.bytes))")
+            if let why = j.blockedBy, case .tree(let t) = j.action {
+                print("     \(o)⚠︎ \(why)\(r) \(g)· go look: \(t.path)\(r)")
+            } else {
+                print("     \(g)\(j.detail)\(r)")
+                print("     \(g)→ baa trees clean \(j.id)\(r)")
+            }
         }
         print("")
     }

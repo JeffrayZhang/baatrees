@@ -26,6 +26,7 @@ turns out most of my RAM wasn't going to apps i had open. it was mostly dev serv
 - tells you how much RAM you'd get back, and frees it in one click
 - pings you a few minutes before you run out
 - also finds dev junk filling up your disk (old builds, package caches etc.) and trashes it in one click
+- 🌳 and git worktrees you stopped using (14+ days untouched). only offers to remove ones with nothing to lose: no uncommitted work, no commits that live only in that tree, nothing running in it. the branch always stays
 
 
 ## install
@@ -60,6 +61,9 @@ that builds the app into `~/Applications`, starts it when you log in, and adds t
 | `baa free all` | free everything it found |
 | `baa disk` | dev junk taking up your disk |
 | `baa disk clean <id>` | clear one (or `all`) |
+| `baa trees` | old git worktrees, and what's keeping the rest around |
+| `baa trees clean <id>` | remove one (or `all` the safe ones) |
+| `baa trees days 30` | count a tree as old after 30 days untouched (default 14) |
 | `baa warn 20 10` | go 🟡 at 20% free and 🔴 at 10% (or tap the sliders icon in the panel) |
 | `baa test` | send a sample notification |
 
