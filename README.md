@@ -2,6 +2,8 @@
 
 *a tiny ram for your RAM*
 
+> **baatrees** is a fork of [selviarora/baa](https://github.com/selviarora/baa) that also finds stale git worktrees eating your disk and removes the safe ones (`baa trees`, or the Disk tab). everything else is selvi's baa, all credit to her 🐏
+
 <img src="icon/icon_1024.png" width="128">
 
 tldr; baa lives in your menu bar, tells you when your mac is about to run out of RAM or disk, finds the stuff quietly eating it, and frees it in one click.
@@ -32,12 +34,18 @@ turns out most of my RAM wasn't going to apps i had open. it was mostly dev serv
 ## install
 
 ```sh
-brew tap selviarora/baa https://github.com/selviarora/baa
-brew install selviarora/baa/baa
-brew services start baa
+brew tap jeffrayzhang/baatrees https://github.com/JeffrayZhang/baatrees
+brew install jeffrayzhang/baatrees/baa
+brew services start jeffrayzhang/baatrees/baa
 ```
 
 that builds baa on your mac, starts it in your menu bar (and at every login), and adds the `baa` command. needs macOS 14+.
+
+already have the original baa from brew? both are called `baa`, so swap it out first:
+
+```sh
+brew services stop baa && brew uninstall baa && brew untap selviarora/baa
+```
 
 <details>
 <summary>or build it yourself</summary>
@@ -45,7 +53,7 @@ that builds baa on your mac, starts it in your menu bar (and at every login), an
 you'll need xcode command line tools (`xcode-select --install`).
 
 ```sh
-git clone https://github.com/selviarora/baa && cd baa
+git clone https://github.com/JeffrayZhang/baatrees && cd baatrees
 ./install.sh
 ```
 
@@ -95,7 +103,7 @@ it will also never kill anything on its own.
 ## update
 
 ```sh
-brew upgrade baa
+brew upgrade jeffrayzhang/baatrees/baa
 ```
 
 or if you built it yourself: `git pull && ./install.sh`
@@ -105,7 +113,7 @@ or if you built it yourself: `git pull && ./install.sh`
 if you used brew:
 
 ```sh
-brew services stop baa && brew uninstall baa
+brew services stop baa && brew uninstall baa && brew untap jeffrayzhang/baatrees
 ```
 
 if you built it yourself:
