@@ -35,6 +35,7 @@ turns out most of my RAM wasn't going to apps i had open. it was mostly dev serv
 
 ```sh
 brew tap jeffrayzhang/baatrees https://github.com/JeffrayZhang/baatrees
+brew trust jeffrayzhang/baatrees      # homebrew 7+ won't load a third-party tap until you trust it
 brew install jeffrayzhang/baatrees/baa
 brew services start jeffrayzhang/baatrees/baa
 ```
@@ -51,6 +52,8 @@ brew services stop baa && brew uninstall baa && brew untap selviarora/baa
 <summary>or build it yourself</summary>
 
 you'll need xcode command line tools (`xcode-select --install`).
+
+heads up: on a work mac running santa in lockdown mode, apps in `~/Applications` can get killed on launch (`zsh: killed baa`). brew installs into `/opt/homebrew`, which is usually allowed, so use brew there. check with `santactl fileinfo ~/Applications/Baa.app/Contents/MacOS/Baa`.
 
 ```sh
 git clone https://github.com/JeffrayZhang/baatrees && cd baatrees
