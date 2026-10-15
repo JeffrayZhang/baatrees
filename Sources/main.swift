@@ -660,6 +660,246 @@ enum Trees {
     }
 }
 
+// MARK: - disk map
+
+// when bytes last changed, hottest first. colorbrewer's RdYlBu, which still reads with red-green colorblindness
+enum Heat {
+    static let edges: [Double] = [86400, 7 * 86400, 30 * 86400, 90 * 86400, 365 * 86400]
+    static let words = ["today", "this week", "this month", "1\u{2013}3 months ago", "3\u{2013}12 months ago", "over a year ago"]
+    static let short = ["today", "week", "month", "3 mo", "year", "older"]
+    static let rgb: [(Double, Double, Double)] = [(215, 48, 39), (252, 141, 89), (254, 224, 144), (224, 243, 248), (145, 191, 219), (69, 117, 180)]
+    static let ansi = [160, 209, 222, 195, 110, 67] // nearest xterm-256 colors, since Terminal.app has no 24-bit color
+    static let dark = [true, false, false, false, false, true] // these need white text
+    static func of(_ age: Double) -> Int { edges.firstIndex { age < $0 } ?? edges.count }
+    static func color(_ i: Int) -> Color { Color(red: rgb[i].0 / 255, green: rgb[i].1 / 255, blue: rgb[i].2 / 255) }
+}
+
+// one box on the map: a folder (or one big file), how much it holds, and when those bytes last changed
+struct Box: Codable {
+    var name: String
+    var bytes = 0.0
+    var ages = SIMD8<Double>() // bytes per Heat bucket. a fixed vector, so a parent adds up its kids in one line
+    var kids: [Box] = []
+    var rest = false // "N smaller items": the small stuff, so the boxes still add up to the folder
+
+    // when most of its bytes last changed. the median, so one fresh .DS_Store can't make a cold folder look hot
+    var heat: Int {
+        var sum = 0.0
+        for i in 0..<Heat.words.count { sum += ages[i]; if sum >= bytes / 2 { return i } }
+        return Heat.words.count - 1
+    }
+    var sorted: [Box] { kids.sorted { $0.bytes > $1.bytes } }
+
+    func find(_ parts: ArraySlice<String>) -> Box? {
+        guard let first = parts.first else { return self }
+        return kids.first { $0.name == first && !$0.rest }?.find(parts.dropFirst())
+    }
+}
+
+enum DiskMap {
+    // iCloud / Dropbox folders can start downloading when you list them
+    static let skip = Set(["Library/CloudStorage", "Library/Mobile Documents"].map { Disk.h($0).path })
+    static let cache = Disk.h("Library/Caches/com.selvi.baa/map.json")
+    static let minBox = 10 * 1_048_576.0
+
+    struct Saved: Codable { let root: String, at: Date, box: Box, denied: Int }
+
+    // shared by every thread of one scan: the stack of folders waiting for a thread, hard links seen, progress
+    final class Walk {
+        let dev: dev_t, at = Date().timeIntervalSince1970, threads = ProcessInfo.processInfo.activeProcessorCount
+        let progress: ((Double) -> Void)?
+        private let lock = NSLock(), work = NSCondition()
+        private var links = Set<UInt64>(), said = Date.distantPast, stack: [Job] = []
+        private(set) var bytes = 0.0, denied = 0, result: Box?
+        init(dev: dev_t, progress: ((Double) -> Void)?) { self.dev = dev; self.progress = progress }
+
+        // a hard link (pnpm, some caches) is one file with several names: count it once
+        func first(_ ino: UInt64) -> Bool { lock.lock(); defer { lock.unlock() }; return links.insert(ino).inserted }
+        func deny() { lock.lock(); denied += 1; lock.unlock() }
+        func found(_ b: Double) {
+            lock.lock(); bytes += b
+            let now = Date(), say = now.timeIntervalSince(said) > 0.25, total = bytes
+            if say { said = now }
+            lock.unlock()
+            if say { progress?(total) }
+        }
+
+        // fewer folders waiting than threads means someone's idle: hand work over instead of keeping it
+        var hungry: Bool { work.lock(); defer { work.unlock() }; return stack.count < threads }
+        func give(_ jobs: [Job]) { work.lock(); stack += jobs; work.broadcast(); work.unlock() }
+        func take() -> Job? {
+            work.lock(); defer { work.unlock() }
+            while stack.isEmpty && result == nil { work.wait() }
+            return stack.popLast() // newest first, so each thread stays depth-first and the stack stays small
+        }
+        func finish(_ b: Box) { work.lock(); result = b; work.broadcast(); work.unlock() }
+    }
+
+    // a folder in flight. it's done once its own listing and every subfolder have reported back
+    final class Job {
+        let path: String, parent: Job?, lock = NSLock()
+        var box: Box, left = 1, items = 0 // left: subfolders still out, plus its own listing
+        init(_ path: String, _ name: String, _ parent: Job?) { self.path = path; self.parent = parent; box = Box(name: name) }
+    }
+
+    static func label(_ p: String) -> String {
+        let home = Disk.home.path
+        return p == home ? "~" : p.hasPrefix(home + "/") ? "~" + p.dropFirst(home.count) : p
+    }
+
+    // a pool of workers sharing one stack of folders. real threads, not GCD: nested concurrentPerform runs one
+    // thread per nest, and GCD won't give long blocking workers a full set of cores either
+    static func scan(_ root: String, progress: ((Double) -> Void)? = nil) -> Saved {
+        var st = stat()
+        guard stat(root, &st) == 0 else { return Saved(root: root, at: Date(), box: Box(name: label(root)), denied: 1) }
+        let w = Walk(dev: st.st_dev, progress: progress), all = DispatchGroup()
+        w.give([Job(root, label(root), nil)])
+        for _ in 0..<w.threads {
+            all.enter()
+            let t = Thread { while let j = w.take() { list(j, w) }; all.leave() }
+            t.stackSize = 16 << 20 // deep node_modules recurse further than the 512 KB default allows
+            t.start()
+        }
+        all.wait()
+        return Saved(root: root, at: Date(), box: w.result ?? Box(name: label(root)), denied: w.denied)
+    }
+
+    // count one folder's files, then hand its subfolders to idle threads or walk them right here.
+    // files are stat'd relative to the folder's fd, so long paths only get resolved once per folder
+    static func list(_ j: Job, _ w: Walk) {
+        var subs: [String] = [], items = 0
+        if let dir = opendir(j.path) {
+            let fd = dirfd(dir)
+            while let e = readdir(dir) {
+                let len = Int(e.pointee.d_namlen)
+                var st = stat()
+                let (dot, ok) = withUnsafePointer(to: &e.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: len + 1) { p -> (Bool, Bool) in
+                        let dot = p[0] == 0x2E && (len == 1 || (len == 2 && p[1] == 0x2E))
+                        return (dot, !dot && fstatat(fd, p, &st, AT_SYMLINK_NOFOLLOW) == 0)
+                    }
+                }
+                guard !dot, ok else { continue }
+                items += 1
+                let nm = { withUnsafePointer(to: &e.pointee.d_name) { $0.withMemoryRebound(to: CChar.self, capacity: len + 1) { String(cString: $0) } } }
+                if st.st_mode & S_IFMT == S_IFDIR {
+                    if st.st_dev == w.dev { subs.append(nm()) } // same disk only: no mounted volumes
+                    continue
+                }
+                if st.st_nlink > 1, !w.first(UInt64(st.st_ino)) { continue }
+                // allocated blocks, not length: sparse files and cloud-only placeholders count for what they really use
+                let b = Double(st.st_blocks) * 512, h = Heat.of(w.at - Double(st.st_mtimespec.tv_sec))
+                j.box.bytes += b; j.box.ages[h] += b
+                if b >= minBox { var f = Box(name: nm()); f.bytes = b; f.ages[h] = b; j.box.kids.append(f) }
+            }
+            closedir(dir)
+        } else { w.deny() }
+        w.found(j.box.bytes)
+        let kids = subs.filter { !skip.contains(j.path + "/" + $0) }.map { Job(j.path + "/" + $0, $0, j) }
+        j.items = items
+        j.left += kids.count // before any kid exists for another thread to finish
+        if kids.count > 1 && w.hungry { w.give(kids) } else { for k in kids { list(k, w) } }
+        done(j, w)
+    }
+
+    // one more piece of j is in. the last piece prunes it and passes it up, so nobody ever blocks waiting on a join
+    static func done(_ j: Job, _ w: Walk) {
+        j.lock.lock(); j.left -= 1; let last = j.left == 0; j.lock.unlock()
+        guard last else { return }
+        prune(&j.box, items: j.items)
+        guard let p = j.parent else { return w.finish(j.box) }
+        p.lock.lock(); p.box.bytes += j.box.bytes; p.box.ages += j.box.ages; p.box.kids.append(j.box); p.lock.unlock()
+        done(p, w)
+    }
+
+    // keep the 40 biggest boxes. no floor relative to the folder: a database dir is 900 small tables, and a
+    // percentage floor would fold every one of them away. the rest becomes one box, so the map still adds up
+    static func prune(_ b: inout Box, items: Int) {
+        let keep = Array(b.sorted.prefix(40).filter { $0.bytes >= minBox })
+        b.kids = keep
+        guard !keep.isEmpty else { return }
+        let n = items - keep.count
+        var rest = Box(name: "\(n) smaller item\(n == 1 ? "" : "s")"); rest.rest = true
+        rest.bytes = b.bytes - keep.reduce(0) { $0 + $1.bytes }
+        rest.ages = b.ages - keep.reduce(SIMD8<Double>()) { $0 + $1.ages }
+        if rest.bytes >= minBox { b.kids.append(rest) }
+    }
+
+    static func save(_ s: Saved) {
+        try? FileManager.default.createDirectory(at: cache.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(s).write(to: cache, options: .atomic)
+    }
+    static func load() -> Saved? { (try? Data(contentsOf: cache)).flatMap { try? JSONDecoder().decode(Saved.self, from: $0) } }
+
+    // the box for a folder, out of a saved scan of it or of anything above it
+    static func lookup(_ s: Saved, _ path: String) -> Box? {
+        if path == s.root { return s.box }
+        guard path.hasPrefix(s.root + "/") else { return nil }
+        return s.box.find(path.dropFirst(s.root.count + 1).split(separator: "/").map(String.init)[...])
+    }
+
+    // squarified treemap (Bruls, Huizing & van Wijk 2000): fill the short side of what's left one row at a time,
+    // and start a new row as soon as adding a box would make the row's skinniest box skinnier. biggest first
+    static func squarify(_ sizes: [Double], _ r: CGRect) -> [CGRect] {
+        let total = sizes.filter { $0 > 0 }.reduce(0, +)
+        var out = [CGRect](repeating: .zero, count: sizes.count)
+        guard total > 0, r.width > 0, r.height > 0 else { return out }
+        let scale = r.width * r.height / total
+        var left = r, row: [Int] = []
+        func area(_ i: Int) -> Double { sizes[i] * scale }
+        func worst(_ row: [Int], _ side: Double) -> Double {
+            let a = row.map(area), s = a.reduce(0, +)
+            return max(side * side * a.max()! / (s * s), s * s / (side * side * a.min()!))
+        }
+        func place(_ row: [Int]) {
+            let s = row.map(area).reduce(0, +)
+            if left.width >= left.height { // a column down the left
+                let t = s / left.height; var y = left.minY
+                for i in row { let h = area(i) / t; out[i] = CGRect(x: left.minX, y: y, width: t, height: h); y += h }
+                left = CGRect(x: left.minX + t, y: left.minY, width: max(0, left.width - t), height: left.height)
+            } else { // a row along the top
+                let t = s / left.width; var x = left.minX
+                for i in row { let w = area(i) / t; out[i] = CGRect(x: x, y: left.minY, width: w, height: t); x += w }
+                left = CGRect(x: left.minX, y: left.minY + t, width: left.width, height: max(0, left.height - t))
+            }
+        }
+        for i in sizes.indices where sizes[i] > 0 {
+            let side = min(left.width, left.height)
+            if !row.isEmpty && worst(row + [i], side) > worst(row, side) { place(row); row = [] }
+            row.append(i)
+        }
+        if !row.isEmpty { place(row) }
+        return out
+    }
+
+    // the map as terminal lines. a cell is about twice as tall as it is wide, so lay it out in half-rows
+    static func draw(_ kids: [Box], cols: Int, rows: Int) -> [String] {
+        let rects = squarify(kids.map(\.bytes), CGRect(x: 0, y: 0, width: cols, height: rows * 2))
+        var bg = Array(repeating: Array(repeating: -1, count: cols), count: rows), fg = bg
+        var ch = Array(repeating: Array(repeating: Character(" "), count: cols), count: rows)
+        for (k, r) in zip(kids, rects) {
+            let x0 = Int(r.minX.rounded()), x1 = min(cols, Int(r.maxX.rounded()))
+            let y0 = Int((r.minY / 2).rounded()), y1 = min(rows, Int((r.maxY / 2).rounded()))
+            guard x1 - x0 >= 2, y1 - y0 >= 1 else { continue }
+            // a blank last column (and last row, when there's room) is the seam between neighbours
+            let xe = x1 - 1, ye = y1 - y0 >= 2 ? y1 - 1 : y1
+            for y in y0..<ye { for x in x0..<xe { bg[y][x] = Heat.ansi[k.heat]; fg[y][x] = Heat.dark[k.heat] ? 231 : 16 } }
+            for (j, s) in [k.name, size(k.bytes)].enumerated() where y0 + j < ye {
+                for (n, c) in s.prefix(max(0, xe - x0 - 1)).enumerated() { ch[y0 + j][x0 + 1 + n] = c }
+            }
+        }
+        return (0..<rows).map { y in
+            var s = "", cur = (-2, -2)
+            for x in 0..<cols {
+                let c = (bg[y][x], fg[y][x])
+                if c != cur { s += c.0 < 0 ? "\u{1B}[0m" : "\u{1B}[48;5;\(c.0)m\u{1B}[38;5;\(c.1)m"; cur = c }
+                s.append(ch[y][x])
+            }
+            return s + "\u{1B}[0m"
+        }
+    }
+}
+
 // MARK: - health
 
 enum Health {
@@ -752,6 +992,9 @@ final class Model: ObservableObject {
     @Published var minutesToRed: Double?
     @Published var toast: String?
     @Published var toastOK = true
+    @Published var map: DiskMap.Saved?
+    @Published var mapping: Double? // bytes found so far while a map scan runs
+    private let mq = DispatchQueue(label: "baa.map")
     @Published var busy: Set<String> = []
     @Published var spark: [Int] = []          // free %, every 10s, last 30 min
     @Published var shears = 0                 // bumps on every free, drives the wool burst
@@ -980,6 +1223,22 @@ final class Model: ObservableObject {
         }
     }
 
+    // the map is only ever scanned when you ask: it reads every file in your home folder
+    func loadMap() {
+        guard map == nil else { return }
+        mq.async { let s = DiskMap.load(); DispatchQueue.main.async { if self.map == nil { self.map = s } } }
+    }
+
+    func mapScan() {
+        guard mapping == nil else { return }
+        mapping = 0
+        mq.async {
+            let s = DiskMap.scan(Disk.home.path) { n in DispatchQueue.main.async { if self.mapping != nil { self.mapping = n } } }
+            DiskMap.save(s)
+            DispatchQueue.main.async { self.map = s; self.mapping = nil }
+        }
+    }
+
     private func flash(_ s: String, ok: Bool = true) {
         toast = s; toastOK = ok
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { if self.toast == s { self.toast = nil } }
@@ -1164,6 +1423,8 @@ struct MenuView: View {
     @State var tab = 0
     @State var showLeftovers = false
     @State var showLimits = false
+    @State var mapPath: [String] = [] // folders clicked into, below ~
+    @State var hover: Int?
 
     private func limitRow(_ dot: String, _ label: String, _ v: Binding<Int>, _ r: ClosedRange<Int>) -> some View {
         HStack(spacing: 8) {
@@ -1218,10 +1479,11 @@ struct MenuView: View {
             Picker("", selection: $tab) {
                 Text("Memory").tag(0)
                 Text("Disk").tag(1)
+                Text("Map").tag(2)
             }
             .pickerStyle(.segmented).labelsHidden()
 
-            if tab == 0 { memory } else { disk }
+            if tab == 0 { memory } else if tab == 1 { disk } else { mapTab }
 
             if let t = m.toast {
                 Text(m.toastOK ? "✓ \(t)" : "⚠︎ \(t)").font(.system(size: 12, weight: .medium))
@@ -1249,7 +1511,8 @@ struct MenuView: View {
         .padding(16)
         .frame(width: 360)
         .fixedSize(horizontal: false, vertical: true)
-        .onAppear { m.rescan(); m.diskScan(ifOlderThan: 15 * 60) }
+        .onAppear { m.rescan(); m.diskScan(ifOlderThan: 15 * 60); m.loadMap() }
+        .onChange(of: m.map?.at) { mapPath = []; hover = nil } // a fresh scan may not have the folder you were in
     }
 
     // MARK: memory tab
@@ -1412,6 +1675,89 @@ struct MenuView: View {
         }
     }
 
+    // MARK: map tab
+
+    var mapHere: Box? { m.map.map { $0.box.find(mapPath[...]) ?? $0.box } }
+    func mapKids(_ b: Box) -> [Box] { b.kids.isEmpty ? [b] : b.sorted.filter { $0.bytes > 0 } }
+
+    @ViewBuilder var mapTab: some View {
+        HStack(spacing: 6) {
+            if !mapPath.isEmpty {
+                Button { mapPath.removeLast(); hover = nil } label: {
+                    Image(systemName: "chevron.left").font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary).help("back out")
+            }
+            Text((["~"] + mapPath).joined(separator: " \u{203A} ")).font(.system(size: 12, weight: .semibold))
+                .lineLimit(1).truncationMode(.head)
+            Spacer()
+            if let n = m.mapping {
+                Text("scanning\u{2026} \(size(n))").font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
+            } else if let s = m.map {
+                Text(s.at.formatted(.relative(presentation: .named))).font(.system(size: 11)).foregroundStyle(.tertiary)
+                Button { m.mapScan() } label: { Image(systemName: "arrow.clockwise").font(.system(size: 11)) }
+                    .buttonStyle(.plain).foregroundStyle(.secondary).help("scan again")
+            }
+        }
+        if let here = mapHere {
+            let kids = mapKids(here)
+            let pick = hover.flatMap { $0 < kids.count ? kids[$0] : nil } ?? here
+            treemap(kids).frame(height: 280).help("click a box to look inside")
+            HStack(spacing: 6) {
+                Circle().fill(Heat.color(pick.heat)).frame(width: 8, height: 8)
+                Text(pick.name).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                Text(size(pick.bytes)).font(.system(size: 12)).monospacedDigit().foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Text("mostly changed \(Heat.words[pick.heat])").font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            HStack(spacing: 7) {
+                ForEach(0..<Heat.short.count, id: \.self) { i in
+                    HStack(spacing: 3) {
+                        RoundedRectangle(cornerRadius: 2).fill(Heat.color(i)).frame(width: 9, height: 9)
+                        Text(Heat.short[i]).font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        } else {
+            VStack(spacing: 6) {
+                Text("\u{1F5FA}\u{FE0F}").font(.system(size: 22))
+                Text("see where your disk went").font(.system(size: 12, weight: .semibold))
+                Text("boxes sized by space, colored by when they last changed. reads every file in your home folder, so it takes a minute or two")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+                Button { m.mapScan() } label: { Text(m.mapping == nil ? "Scan my disk" : "Scanning\u{2026} \(size(m.mapping ?? 0))") }
+                    .buttonStyle(.borderedProminent).disabled(m.mapping != nil).padding(.top, 4)
+            }
+            .frame(maxWidth: .infinity).padding(.vertical, 16)
+        }
+    }
+
+    func treemap(_ kids: [Box]) -> some View {
+        GeometryReader { g in
+            let rects = DiskMap.squarify(kids.map(\.bytes), CGRect(origin: .zero, size: g.size))
+            Canvas { c, _ in
+                for (i, r) in rects.enumerated() where r.width >= 2 && r.height >= 2 {
+                    let k = kids[i], box = r.insetBy(dx: 1, dy: 1), shape = Path(roundedRect: box, cornerRadius: 3)
+                    c.fill(shape, with: .color(Heat.color(k.heat)))
+                    if hover == i { c.stroke(shape, with: .color(.primary), lineWidth: 2) }
+                    guard box.width >= 44, box.height >= 30 else { continue }
+                    let ink = Heat.dark[k.heat] ? Color.white : Color.black
+                    c.draw(Text(k.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(ink),
+                           in: CGRect(x: box.minX + 5, y: box.minY + 4, width: box.width - 10, height: 14))
+                    c.draw(Text(size(k.bytes)).font(.system(size: 10)).foregroundStyle(ink.opacity(0.75)),
+                           in: CGRect(x: box.minX + 5, y: box.minY + 18, width: box.width - 10, height: 13))
+                }
+            }
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                if case .active(let p) = phase { hover = rects.firstIndex { $0.contains(p) } } else { hover = nil }
+            }
+            .onTapGesture { p in
+                guard let i = rects.firstIndex(where: { $0.contains(p) }), !kids[i].rest, !kids[i].kids.isEmpty else { return }
+                mapPath.append(kids[i].name); hover = nil
+            }
+        }
+    }
+
     func junkRow(_ j: Junk) -> some View {
         HStack(alignment: .center, spacing: 10) {
             Text(j.icon).font(.system(size: 14))
@@ -1464,11 +1810,12 @@ enum CLI {
         case "--free", "free": free(rest.first ?? "")
         case "disk": disk(rest)
         case "trees": trees(rest)
+        case "map": map(rest)
         case "warn": warn(rest)
         case "film": film(rest.first ?? "frames")
-        case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"), disk: rest.contains("--disk"))
+        case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"), disk: rest.contains("--disk"), map: rest.contains("--map"))
         default:
-            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa trees            old git worktrees taking up disk\nbaa trees clean <id> remove one (or 'all' the safe ones)\nbaa trees days <n>   count a tree as old after n days (default 14)\nbaa warn <y> [r]     go yellow / red at this % free\nbaa warn --no-trend  turn off the dropping-fast heads-up\nbaa test             sample notification")
+            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa trees            old git worktrees taking up disk\nbaa trees clean <id> remove one (or 'all' the safe ones)\nbaa trees days <n>   count a tree as old after n days (default 14)\nbaa map [folder]     where your disk went, colored by when it last changed\nbaa warn <y> [r]     go yellow / red at this % free\nbaa warn --no-trend  turn off the dropping-fast heads-up\nbaa test             sample notification")
         }
     }
 
@@ -1513,7 +1860,7 @@ enum CLI {
     }
 
     // draws the real menu panel (live data) to a png, for the readme
-    static func snapshot(_ path: String, dark: Bool, demo: Bool = false, disk: Bool = false) {
+    static func snapshot(_ path: String, dark: Bool, demo: Bool = false, disk: Bool = false, map: Bool = false) {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         let look = NSAppearance(named: dark ? .darkAqua : .aqua)
@@ -1521,7 +1868,8 @@ enum CLI {
         let m = Model.shared
         m.free = Mem.freePct; m.level = Mem.level; m.swap = Mem.swapGB
         m.scan = Engine().scan()
-        m.junk = Disk.scan(); m.diskFree = Disk.free; m.diskTotal = Disk.total
+        m.junk = map ? [] : Disk.scan(); m.diskFree = Disk.free; m.diskTotal = Disk.total
+        m.map = DiskMap.load()
         if demo {
             // sample leftovers for readme screenshots (same two baa caught for real while testing)
             m.free = 74; m.level = 1
@@ -1534,7 +1882,8 @@ enum CLI {
             m.spark = (0..<180).map { (i: Int) -> Int in let x = Double(i); return Int(70.0 + x * 0.02 + sin(x / 9.0) * 2.5) }
             m.freedToday = 2.3e9; m.freedAll = 48e9
         }
-        let panel = MenuView(tab: disk ? 1 : 0, showLeftovers: demo, showLimits: ProcessInfo.processInfo.environment["BAA_SHOW_LIMITS"] != nil)
+        let panel = MenuView(tab: map ? 2 : disk ? 1 : 0, showLeftovers: demo, showLimits: ProcessInfo.processInfo.environment["BAA_SHOW_LIMITS"] != nil,
+                             mapPath: (ProcessInfo.processInfo.environment["BAA_MAP_PATH"] ?? "").split(separator: "/").map(String.init))
             .background(RoundedRectangle(cornerRadius: 14).fill(Color(nsColor: .windowBackgroundColor)))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.1), lineWidth: 1))
             .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
@@ -1649,6 +1998,39 @@ enum CLI {
             print(j.trashes ? "moved \(size(j.bytes)) to the Trash · \(j.title)" : "\(j.isTree ? "removed" : "cleared") \(size(j.bytes)) · \(j.title)")
         }
         if picks.contains(where: \.trashes) { print("\(g)empty the Trash to get the space back\(r)") }
+    }
+
+    // `baa map [folder] [--rescan]`. drilling into a folder reuses the last home scan, so it's instant
+    static func map(_ rest: [String]) {
+        let g = "\u{1B}[90m", b = "\u{1B}[1m", r = "\u{1B}[0m", home = Disk.home.path
+        let arg = (rest.first { !$0.hasPrefix("--") } ?? home) as NSString
+        let path = URL(fileURLWithPath: arg.expandingTildeInPath).standardizedFileURL.path
+        var saved = DiskMap.load()
+        if rest.contains("--rescan") || saved.flatMap({ DiskMap.lookup($0, path) }) == nil {
+            let err = FileHandle.standardError
+            let s = DiskMap.scan(path) { n in err.write(Data("\r  scanning \(DiskMap.label(path)) \u{00B7} \(size(n)) so far ".utf8)) }
+            err.write(Data("\r\u{1B}[K".utf8))
+            if path == home { DiskMap.save(s) }
+            saved = s
+        }
+        guard let saved, let box = DiskMap.lookup(saved, path) else { print("couldn't read \(path)"); return }
+        var ws = winsize()
+        let cols = ioctl(STDOUT_FILENO, 0x40087468 /* TIOCGWINSZ */, &ws) == 0 && ws.ws_col >= 40 ? min(Int(ws.ws_col) - 4, 110) : 76
+        let kids = box.kids.isEmpty ? [box] : box.sorted.filter { $0.bytes > 0 }
+        let ago = Date().timeIntervalSince(saved.at)
+        print("\n  \(b)DISK MAP\(r)  \(DiskMap.label(path)) \u{00B7} \(size(box.bytes)) \u{00B7} mostly changed \(Heat.words[box.heat])")
+        print("  \(g)scanned \(ago < 60 ? "just now" : dur(ago) + " ago") \u{00B7} baa map --rescan for fresh numbers\(r)\n")
+        for line in DiskMap.draw(kids, cols: cols, rows: 18) { print("  " + line) }
+        let swatch = { (i: Int) in "\u{1B}[48;5;\(Heat.ansi[i])m  \(r)" }
+        print("\n  \(g)changed\(r) " + (0..<Heat.short.count).map { "\(swatch($0)) \(Heat.short[$0])" }.joined(separator: "  ") + "\n")
+        for k in kids.prefix(12) {
+            let name = k.name.count > 28 ? String(k.name.prefix(27)) + "\u{2026}" : k.name, sz = size(k.bytes)
+            let sub = DiskMap.label(path + "/" + k.name), quoted = sub.contains(" ") ? "\"\(sub)\"" : sub
+            let next = k.kids.isEmpty || k.rest ? "" : "  \(g)\u{2192} baa map \(quoted)\(r)"
+            print("  \(swatch(k.heat)) \(name.padding(toLength: 29, withPad: " ", startingAt: 0))\(String(repeating: " ", count: max(0, 9 - sz.count)))\(sz)  \(g)\(Heat.words[k.heat])\(r)\(next)")
+        }
+        if saved.denied > 0 { print("\n  \(g)\(saved.denied) folders macOS wouldn't let baa read (privacy settings) aren't counted\(r)") }
+        print("")
     }
 
     static func trees(_ rest: [String]) {
