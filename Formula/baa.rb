@@ -2,7 +2,7 @@ class Baa < Formula
   desc "Tiny ram for your RAM: menu bar app that frees what your dev tools left running"
   homepage "https://github.com/JeffrayZhang/baatrees"
   # trees-v<upstream version>.<n>: never collides with upstream's v* tags, and brew reads it as 1.2.0.1 > 1.2.0
-  url "https://github.com/JeffrayZhang/baatrees.git", tag: "trees-v1.2.0.1"
+  url "https://github.com/JeffrayZhang/baatrees.git", tag: "trees-v1.2.0.2"
   license "MIT"
 
   depends_on macos: :sonoma
