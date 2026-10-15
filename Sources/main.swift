@@ -872,6 +872,31 @@ enum DiskMap {
         return out
     }
 
+    // one drawn box. `open` ones are a frame with a title strip and their own kids laid out inside
+    struct Tile {
+        let rect: CGRect, box: Box, path: [String], depth: Int, open: Bool, title: String
+        var key: String { (path + (box.rest ? ["\u{0}rest"] : [])).joined(separator: "/") } // "N smaller items" shares its folder's path
+    }
+
+    // boxes inside boxes, `levels` deep. parents come before their kids, so the last tile under the mouse is the deepest
+    static func tiles(_ kids: [Box], _ r: CGRect, path: [String] = [], depth: Int = 0, levels: Int) -> [Tile] {
+        var out: [Tile] = []
+        for (k, rect) in zip(kids, squarify(kids.map(\.bytes), r)) where rect.width >= 3 && rect.height >= 3 {
+            var p = k.rest ? path : path + [k.name], title = k.name, end = k
+            let open = depth + 1 < levels && !k.rest && !k.kids.isEmpty && rect.width >= 70 && rect.height >= 48
+            // a folder whose only content is one folder (world's trees/<name>/src) folds into one box, like a radix
+            // tree folds single-child chains, so the level inside shows what's in src instead of just "src"
+            while open, end.kids.count == 1, let only = end.kids.first, !only.rest, !only.kids.isEmpty {
+                end = only; p.append(only.name); title += "/" + only.name
+            }
+            out.append(Tile(rect: rect, box: k, path: p, depth: depth, open: open, title: title))
+            // the title strip takes some area, so kids are a little smaller than their bytes. every nested treemap pays that
+            let inside = CGRect(x: rect.minX + 3, y: rect.minY + 18, width: rect.width - 6, height: rect.height - 21)
+            if open { out += tiles(end.sorted.filter { $0.bytes > 0 }, inside, path: p, depth: depth + 1, levels: levels) }
+        }
+        return out
+    }
+
     // the map as terminal lines. a cell is about twice as tall as it is wide, so lay it out in half-rows
     static func draw(_ kids: [Box], cols: Int, rows: Int) -> [String] {
         let rects = squarify(kids.map(\.bytes), CGRect(x: 0, y: 0, width: cols, height: rows * 2))
@@ -1423,8 +1448,7 @@ struct MenuView: View {
     @State var tab = 0
     @State var showLeftovers = false
     @State var showLimits = false
-    @State var mapPath: [String] = [] // folders clicked into, below ~
-    @State var hover: Int?
+    var mapPath: [String] = [] // where the map tab starts. snapshots use it to start drilled in
 
     private func limitRow(_ dot: String, _ label: String, _ v: Binding<Int>, _ r: ClosedRange<Int>) -> some View {
         HStack(spacing: 8) {
@@ -1483,7 +1507,7 @@ struct MenuView: View {
             }
             .pickerStyle(.segmented).labelsHidden()
 
-            if tab == 0 { memory } else if tab == 1 { disk } else { mapTab }
+            if tab == 0 { memory } else if tab == 1 { disk } else { MapView(path: mapPath) }
 
             if let t = m.toast {
                 Text(m.toastOK ? "✓ \(t)" : "⚠︎ \(t)").font(.system(size: 12, weight: .medium))
@@ -1512,7 +1536,6 @@ struct MenuView: View {
         .frame(width: 360)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear { m.rescan(); m.diskScan(ifOlderThan: 15 * 60); m.loadMap() }
-        .onChange(of: m.map?.at) { mapPath = []; hover = nil } // a fresh scan may not have the folder you were in
     }
 
     // MARK: memory tab
@@ -1675,89 +1698,6 @@ struct MenuView: View {
         }
     }
 
-    // MARK: map tab
-
-    var mapHere: Box? { m.map.map { $0.box.find(mapPath[...]) ?? $0.box } }
-    func mapKids(_ b: Box) -> [Box] { b.kids.isEmpty ? [b] : b.sorted.filter { $0.bytes > 0 } }
-
-    @ViewBuilder var mapTab: some View {
-        HStack(spacing: 6) {
-            if !mapPath.isEmpty {
-                Button { mapPath.removeLast(); hover = nil } label: {
-                    Image(systemName: "chevron.left").font(.system(size: 11, weight: .semibold))
-                }
-                .buttonStyle(.plain).foregroundStyle(.secondary).help("back out")
-            }
-            Text((["~"] + mapPath).joined(separator: " \u{203A} ")).font(.system(size: 12, weight: .semibold))
-                .lineLimit(1).truncationMode(.head)
-            Spacer()
-            if let n = m.mapping {
-                Text("scanning\u{2026} \(size(n))").font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
-            } else if let s = m.map {
-                Text(s.at.formatted(.relative(presentation: .named))).font(.system(size: 11)).foregroundStyle(.tertiary)
-                Button { m.mapScan() } label: { Image(systemName: "arrow.clockwise").font(.system(size: 11)) }
-                    .buttonStyle(.plain).foregroundStyle(.secondary).help("scan again")
-            }
-        }
-        if let here = mapHere {
-            let kids = mapKids(here)
-            let pick = hover.flatMap { $0 < kids.count ? kids[$0] : nil } ?? here
-            treemap(kids).frame(height: 280).help("click a box to look inside")
-            HStack(spacing: 6) {
-                Circle().fill(Heat.color(pick.heat)).frame(width: 8, height: 8)
-                Text(pick.name).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
-                Text(size(pick.bytes)).font(.system(size: 12)).monospacedDigit().foregroundStyle(.secondary)
-                Spacer(minLength: 4)
-                Text("mostly changed \(Heat.words[pick.heat])").font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-            }
-            HStack(spacing: 7) {
-                ForEach(0..<Heat.short.count, id: \.self) { i in
-                    HStack(spacing: 3) {
-                        RoundedRectangle(cornerRadius: 2).fill(Heat.color(i)).frame(width: 9, height: 9)
-                        Text(Heat.short[i]).font(.system(size: 10)).foregroundStyle(.secondary)
-                    }
-                }
-            }
-        } else {
-            VStack(spacing: 6) {
-                Text("\u{1F5FA}\u{FE0F}").font(.system(size: 22))
-                Text("see where your disk went").font(.system(size: 12, weight: .semibold))
-                Text("boxes sized by space, colored by when they last changed. reads every file in your home folder, so it takes a minute or two")
-                    .font(.system(size: 11)).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
-                Button { m.mapScan() } label: { Text(m.mapping == nil ? "Scan my disk" : "Scanning\u{2026} \(size(m.mapping ?? 0))") }
-                    .buttonStyle(.borderedProminent).disabled(m.mapping != nil).padding(.top, 4)
-            }
-            .frame(maxWidth: .infinity).padding(.vertical, 16)
-        }
-    }
-
-    func treemap(_ kids: [Box]) -> some View {
-        GeometryReader { g in
-            let rects = DiskMap.squarify(kids.map(\.bytes), CGRect(origin: .zero, size: g.size))
-            Canvas { c, _ in
-                for (i, r) in rects.enumerated() where r.width >= 2 && r.height >= 2 {
-                    let k = kids[i], box = r.insetBy(dx: 1, dy: 1), shape = Path(roundedRect: box, cornerRadius: 3)
-                    c.fill(shape, with: .color(Heat.color(k.heat)))
-                    if hover == i { c.stroke(shape, with: .color(.primary), lineWidth: 2) }
-                    guard box.width >= 44, box.height >= 30 else { continue }
-                    let ink = Heat.dark[k.heat] ? Color.white : Color.black
-                    c.draw(Text(k.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(ink),
-                           in: CGRect(x: box.minX + 5, y: box.minY + 4, width: box.width - 10, height: 14))
-                    c.draw(Text(size(k.bytes)).font(.system(size: 10)).foregroundStyle(ink.opacity(0.75)),
-                           in: CGRect(x: box.minX + 5, y: box.minY + 18, width: box.width - 10, height: 13))
-                }
-            }
-            .contentShape(Rectangle())
-            .onContinuousHover { phase in
-                if case .active(let p) = phase { hover = rects.firstIndex { $0.contains(p) } } else { hover = nil }
-            }
-            .onTapGesture { p in
-                guard let i = rects.firstIndex(where: { $0.contains(p) }), !kids[i].rest, !kids[i].kids.isEmpty else { return }
-                mapPath.append(kids[i].name); hover = nil
-            }
-        }
-    }
-
     func junkRow(_ j: Junk) -> some View {
         HStack(alignment: .center, spacing: 10) {
             Text(j.icon).font(.system(size: 14))
@@ -1777,6 +1717,203 @@ struct MenuView: View {
             .disabled(m.busy.contains(j.id) || j.blockedBy != nil)
             .fixedSize().layoutPriority(1)
         }
+    }
+}
+
+// MARK: - map view
+
+// the treemap. in the menu panel it's one level and small; in its own window it's boxes inside boxes, plus a list
+struct MapView: View {
+    @ObservedObject var m = Model.shared
+    @State var path: [String]
+    @State var hot: (key: String, box: Box, path: [String])? // under the mouse, in the map or the list
+    let expanded: Bool
+    init(path: [String] = [], expanded: Bool = false) { _path = State(initialValue: path); self.expanded = expanded }
+
+    var here: Box? { m.map.map { $0.box.find(path[...]) ?? $0.box } }
+    func kids(_ b: Box) -> [Box] { b.kids.isEmpty ? [b] : b.sorted.filter { $0.bytes > 0 } }
+    func zoom(_ to: [String]) { path += to; hot = nil }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: expanded ? 12 : 14) {
+            header
+            if let here {
+                if expanded {
+                    HStack(alignment: .top, spacing: 14) {
+                        treemap(here).frame(maxWidth: .infinity, maxHeight: .infinity)
+                        list(here).frame(width: 280)
+                    }
+                } else {
+                    treemap(here).frame(height: 280)
+                }
+                info(here)
+                legend
+            } else {
+                empty
+            }
+        }
+        .padding(expanded ? 18 : 0)
+        .frame(maxWidth: expanded ? .infinity : nil, maxHeight: expanded ? .infinity : nil, alignment: .topLeading)
+        .onAppear { m.loadMap() }
+        .onChange(of: m.map?.at) { path = []; hot = nil } // a fresh scan may not have the folder you were in
+    }
+
+    var header: some View {
+        HStack(spacing: 6) {
+            if !path.isEmpty {
+                Button { path.removeLast(); hot = nil } label: {
+                    Image(systemName: "chevron.left").font(.system(size: expanded ? 13 : 11, weight: .semibold))
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary).help("back out (\u{2318}[)").keyboardShortcut("[", modifiers: .command)
+            }
+            if expanded {
+                // every folder on the way down is a button back up to it
+                ForEach(Array((["~"] + path).enumerated()), id: \.offset) { i, name in
+                    if i > 0 { Text("\u{203A}").foregroundStyle(.tertiary) }
+                    Button(name) { path = Array(path.prefix(i)); hot = nil }
+                        .buttonStyle(.plain).font(.system(size: 13, weight: i == path.count ? .semibold : .regular))
+                        .foregroundStyle(i == path.count ? .primary : .secondary)
+                }
+            } else {
+                Text((["~"] + path).joined(separator: " \u{203A} ")).font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1).truncationMode(.head)
+            }
+            Spacer()
+            if let n = m.mapping {
+                Text("scanning\u{2026} \(size(n))").font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
+            } else if let s = m.map {
+                Text(s.at.formatted(.relative(presentation: .named))).font(.system(size: 11)).foregroundStyle(.tertiary)
+                Button { m.mapScan() } label: { Image(systemName: "arrow.clockwise").font(.system(size: 11)) }
+                    .buttonStyle(.plain).foregroundStyle(.secondary).help("scan again")
+            }
+            if !expanded && m.map != nil {
+                Button { MapWindow.show(path) } label: { Image(systemName: "arrow.up.left.and.arrow.down.right").font(.system(size: 11)) }
+                    .buttonStyle(.plain).foregroundStyle(.secondary).help("open the map in its own window")
+            }
+        }
+    }
+
+    func treemap(_ b: Box) -> some View {
+        GeometryReader { g in
+            let tiles = DiskMap.tiles(kids(b), CGRect(origin: .zero, size: g.size), levels: expanded ? 3 : 1)
+            Canvas { c, _ in
+                for t in tiles {
+                    let r = t.rect.insetBy(dx: 1, dy: 1), shape = Path(roundedRect: r, cornerRadius: 3), col = Heat.color(t.box.heat)
+                    if t.open {
+                        // a frame: tinted so its kids stand out, with the folder's name on a title strip
+                        c.fill(shape, with: .color(col.opacity(0.35)))
+                        c.draw(Text(t.title).font(.system(size: 11, weight: .semibold)) + Text("  " + size(t.box.bytes)).font(.system(size: 10)).foregroundColor(.secondary),
+                               in: CGRect(x: r.minX + 5, y: r.minY + 2, width: r.width - 10, height: 14))
+                        continue
+                    }
+                    c.fill(shape, with: .color(col))
+                    guard r.width >= 44, r.height >= 30 else { continue }
+                    let ink = Heat.dark[t.box.heat] ? Color.white : Color.black
+                    c.draw(Text(t.box.name).font(.system(size: 11, weight: .semibold)).foregroundStyle(ink),
+                           in: CGRect(x: r.minX + 5, y: r.minY + 4, width: r.width - 10, height: 14))
+                    c.draw(Text(size(t.box.bytes)).font(.system(size: 10)).foregroundStyle(ink.opacity(0.75)),
+                           in: CGRect(x: r.minX + 5, y: r.minY + 18, width: r.width - 10, height: 13))
+                }
+                if let h = hot, let t = tiles.first(where: { $0.key == h.key }) {
+                    c.stroke(Path(roundedRect: t.rect.insetBy(dx: 1, dy: 1), cornerRadius: 3), with: .color(.primary), lineWidth: 2)
+                }
+            }
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                guard case .active(let p) = phase, let t = tiles.last(where: { $0.rect.contains(p) }) else { hot = nil; return }
+                hot = (t.key, t.box, t.box.rest ? t.path + [t.box.name] : t.path)
+            }
+            .onTapGesture { p in
+                // the deepest folder under the click: a file or "N smaller items" zooms into the folder around it
+                if let t = tiles.last(where: { $0.rect.contains(p) && !$0.box.rest && !$0.box.kids.isEmpty }) { zoom(t.path) }
+            }
+        }
+        .help("click a box to look inside")
+    }
+
+    // every item in this folder, including the ones too small to label on the map
+    func list(_ here: Box) -> some View {
+        ScrollView {
+            LazyVStack(spacing: 1) {
+                ForEach(Array(kids(here).enumerated()), id: \.offset) { _, k in
+                    let key = k.rest ? "\u{0}rest" : k.name, can = !k.rest && !k.kids.isEmpty
+                    HStack(spacing: 8) {
+                        RoundedRectangle(cornerRadius: 2).fill(Heat.color(k.heat)).frame(width: 10, height: 10)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(k.name).font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
+                            Bar(fraction: k.bytes / max(here.bytes, 1), color: Heat.color(k.heat)).frame(height: 3)
+                        }
+                        Text(size(k.bytes)).font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+                            .frame(width: 62, alignment: .trailing)
+                        Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.tertiary).opacity(can ? 1 : 0)
+                    }
+                    .padding(.vertical, 5).padding(.horizontal, 8)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(hot?.key == key ? 0.08 : 0)))
+                    .contentShape(Rectangle())
+                    .onHover { inside in if inside { hot = (key, k, k.rest ? [k.name] : [k.name]) } else if hot?.key == key { hot = nil } }
+                    .onTapGesture { if can { zoom([k.name]) } }
+                }
+            }
+        }
+    }
+
+    func info(_ here: Box) -> some View {
+        let b = hot?.box ?? here, at = (["~"] + path + (hot?.path ?? [])).joined(separator: "/")
+        return HStack(spacing: 6) {
+            Circle().fill(Heat.color(b.heat)).frame(width: 8, height: 8)
+            Text(expanded ? at : b.name).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
+            Text(size(b.bytes)).font(.system(size: 12)).monospacedDigit().foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            Text("mostly changed \(Heat.words[b.heat])").font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+        }
+    }
+
+    var legend: some View {
+        HStack(spacing: 7) {
+            ForEach(0..<Heat.short.count, id: \.self) { i in
+                HStack(spacing: 3) {
+                    RoundedRectangle(cornerRadius: 2).fill(Heat.color(i)).frame(width: 9, height: 9)
+                    Text(Heat.short[i]).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+            if expanded {
+                Spacer()
+                Text("click to look inside \u{00B7} \u{2318}[ to go back").font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    var empty: some View {
+        VStack(spacing: 6) {
+            Text("\u{1F5FA}\u{FE0F}").font(.system(size: 22))
+            Text("see where your disk went").font(.system(size: 12, weight: .semibold))
+            Text("boxes sized by space, colored by when they last changed. reads every file in your home folder, so it takes a minute or two")
+                .font(.system(size: 11)).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+            Button { m.mapScan() } label: { Text(m.mapping == nil ? "Scan my disk" : "Scanning\u{2026} \(size(m.mapping ?? 0))") }
+                .buttonStyle(.borderedProminent).disabled(m.mapping != nil).padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity, maxHeight: expanded ? .infinity : nil).padding(.vertical, 16)
+    }
+}
+
+// the map in a window you can make as big as your screen. baa has no dock icon (LSUIElement), so it has to
+// activate itself or the window opens behind whatever you're in, and it keeps the window so closing doesn't free it
+enum MapWindow {
+    static var window: NSWindow?
+
+    static func show(_ path: [String]) {
+        let w = window ?? {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 740),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            w.title = "Disk map"; w.isReleasedWhenClosed = false; w.minSize = NSSize(width: 720, height: 480)
+            w.center(); w.setFrameAutosaveName("baa.map") // remembers where you put it and how big
+            window = w
+            return w
+        }()
+        w.contentView = NSHostingView(rootView: MapView(path: path, expanded: true)) // starts where the panel was
+        NSApp.activate()
+        w.makeKeyAndOrderFront(nil)
+        w.orderFrontRegardless() // macOS 14 won't let `baa map --window` take focus from your terminal, but it can still go on top
     }
 }
 
@@ -1813,9 +1950,9 @@ enum CLI {
         case "map": map(rest)
         case "warn": warn(rest)
         case "film": film(rest.first ?? "frames")
-        case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"), disk: rest.contains("--disk"), map: rest.contains("--map"))
+        case "snapshot": snapshot(rest.first { !$0.hasPrefix("--") } ?? "baa.png", dark: rest.contains("--dark"), demo: rest.contains("--demo"), disk: rest.contains("--disk"), map: rest.contains("--map"), expanded: rest.contains("--expanded"))
         default:
-            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa trees            old git worktrees taking up disk\nbaa trees clean <id> remove one (or 'all' the safe ones)\nbaa trees days <n>   count a tree as old after n days (default 14)\nbaa map [folder]     where your disk went, colored by when it last changed\nbaa warn <y> [r]     go yellow / red at this % free\nbaa warn --no-trend  turn off the dropping-fast heads-up\nbaa test             sample notification")
+            print("baa                  RAM readout + leftovers\nbaa free <id>        free one leftover (or 'all')\nbaa disk             dev junk taking up disk\nbaa disk clean <id>  clear one (or 'all')\nbaa trees            old git worktrees taking up disk\nbaa trees clean <id> remove one (or 'all' the safe ones)\nbaa trees days <n>   count a tree as old after n days (default 14)\nbaa map [folder]     where your disk went, colored by when it last changed\nbaa map --window     the same map in a big window\nbaa warn <y> [r]     go yellow / red at this % free\nbaa warn --no-trend  turn off the dropping-fast heads-up\nbaa test             sample notification")
         }
     }
 
@@ -1860,7 +1997,7 @@ enum CLI {
     }
 
     // draws the real menu panel (live data) to a png, for the readme
-    static func snapshot(_ path: String, dark: Bool, demo: Bool = false, disk: Bool = false, map: Bool = false) {
+    static func snapshot(_ path: String, dark: Bool, demo: Bool = false, disk: Bool = false, map: Bool = false, expanded: Bool = false) {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         let look = NSAppearance(named: dark ? .darkAqua : .aqua)
@@ -1888,7 +2025,10 @@ enum CLI {
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.primary.opacity(0.1), lineWidth: 1))
             .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
             .padding(36)
-        let host = NSHostingView(rootView: panel)
+        let start = (ProcessInfo.processInfo.environment["BAA_MAP_PATH"] ?? "").split(separator: "/").map(String.init)
+        let host = NSHostingView(rootView: expanded
+            ? AnyView(MapView(path: start, expanded: true).frame(width: 1100, height: 740).background(Color(nsColor: .windowBackgroundColor)))
+            : AnyView(panel))
         host.appearance = look
         host.frame.size = host.fittingSize
         let win = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
@@ -2005,6 +2145,7 @@ enum CLI {
         let g = "\u{1B}[90m", b = "\u{1B}[1m", r = "\u{1B}[0m", home = Disk.home.path
         let arg = (rest.first { !$0.hasPrefix("--") } ?? home) as NSString
         let path = URL(fileURLWithPath: arg.expandingTildeInPath).standardizedFileURL.path
+        if rest.contains("--window") { return mapWindow(path == home ? [] : path.hasPrefix(home + "/") ? path.dropFirst(home.count + 1).split(separator: "/").map(String.init) : []) }
         var saved = DiskMap.load()
         if rest.contains("--rescan") || saved.flatMap({ DiskMap.lookup($0, path) }) == nil {
             let err = FileHandle.standardError
@@ -2031,6 +2172,17 @@ enum CLI {
         }
         if saved.denied > 0 { print("\n  \(g)\(saved.denied) folders macOS wouldn't let baa read (privacy settings) aren't counted\(r)") }
         print("")
+    }
+
+    // `baa map --window`: the big map straight from the terminal, no menu bar app needed. quits when you close it
+    static func mapWindow(_ path: [String]) {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        Model.shared.map = DiskMap.load()
+        MapWindow.show(path)
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: MapWindow.window, queue: .main) { _ in app.terminate(nil) }
+        if let f = MapWindow.window?.frame { print("opened the disk map (\(Int(f.width))x\(Int(f.height))) \u{00B7} close it to quit"); fflush(stdout) } // run() never returns, so nothing else would flush it
+        app.run()
     }
 
     static func trees(_ rest: [String]) {

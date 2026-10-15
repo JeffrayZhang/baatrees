@@ -29,7 +29,7 @@ turns out most of my RAM wasn't going to apps i had open. it was mostly dev serv
 - pings you a few minutes before you run out
 - also finds dev junk filling up your disk (old builds, package caches etc.) and trashes it in one click
 - 🌳 and git worktrees you stopped using (14+ days untouched). only offers to remove ones with nothing to lose: no uncommitted work, no commits that live only in that tree, nothing running in it. the branch always stays
-- 🗺️ a disk map: a treemap of everything in your home folder, colored by when it last changed. big and blue = space nobody's touching. reads every file, so the first scan takes a minute or two
+- 🗺️ a disk map: a treemap of everything in your home folder, colored by when it last changed. big and blue = space nobody's touching. reads every file, so the first scan takes a minute or two. hit ⤢ to open it in a big window where folders open up inside each other
 
 
 ## install
@@ -78,6 +78,7 @@ that builds the app into `~/Applications`, starts it when you log in, and adds t
 | `baa trees days 30` | count a tree as old after 30 days untouched (default 14) |
 | `baa map` | treemap of your home folder: box size = space, color = when it last changed (also the Map tab) |
 | `baa map ~/world` | look inside one folder. instant after the first scan; `--rescan` for fresh numbers |
+| `baa map --window` | the map in a big resizable window: folders open up inside each other, plus a list of everything (or hit ⤢ on the Map tab) |
 | `baa warn 20 10` | go 🟡 at 20% free and 🔴 at 10% (or tap the sliders icon in the panel) |
 | `baa test` | send a sample notification |
 
